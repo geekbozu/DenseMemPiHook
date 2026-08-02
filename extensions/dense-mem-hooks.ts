@@ -139,11 +139,16 @@ function detectRepoCached(cwd: string): string | undefined {
   return cachedRepo;
 }
 
-async function rpc(server: { url: string; token: string }, timeoutMs: number, method: string, params: unknown): Promise<any> {
+async function rpc(server: { url: string; token: string }, timeoutMs: number, method: string, params: unknown, externalSignal?: AbortSignal): Promise<any> {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs); // never hang session_start on a dead server
+  const signal =
+    externalSignal && typeof AbortSignal.any === "function"
+      ? AbortSignal.any([externalSignal, timeoutSignal])
+      : timeoutSignal;
   const resp = await fetch(server.url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${server.token}` },
-    signal: AbortSignal.timeout(timeoutMs), // never hang session_start on a dead server
+    signal,
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   return resp.json();
@@ -215,11 +220,11 @@ export default function (pi: ExtensionAPI) {
               typeof (Type as any).Unsafe === "function"
                 ? (Type as any).Unsafe(def.schema)
                 : def.schema,
-            async execute(_toolCallId, params) {
+            async execute(_toolCallId, params, signal) {
               const res = await rpc(cfg.server, cfg.timeoutMs!, "tools/call", {
                 name: def.name,
                 arguments: params ?? {},
-              });
+              }, signal);
               return mapMcpResult(res?.result);
             },
           });

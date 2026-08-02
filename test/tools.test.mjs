@@ -101,8 +101,8 @@ test("session_start injects discovered tools when mcp.json does not manage dense
   assert.equal(registered[1].name, "dense_mem_remember");
   assert.ok(registered[0].parameters, "schema passed through (Unsafe)");
 
-  // executing a registered tool proxies tools/call
-  const out = await registered[0].execute("call-1", { query: "x" });
+  // executing a registered tool proxies tools/call (ctx.signal supported)
+  const out = await registered[0].execute("call-1", { query: "x" }, new AbortController().signal);
   assert.equal(out.content[0].text, JSON.stringify({ ok: true, method: "dense_mem_recall_memory" }));
   assert.equal(out.isError, false);
   assert.equal(sent.length, 0, "recall returned no results — no context message");
