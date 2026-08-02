@@ -3,6 +3,7 @@ import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 // This extension's own directory (resolves correctly under jiti) — prompts/ ships next to extensions/.
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -138,17 +139,18 @@ function detectRepoCached(cwd: string): string | undefined {
   return cachedRepo;
 }
 
-async function dmCall(server: { url: string; token: string }, timeoutMs: number, method: string, args: Record<string, unknown>): Promise<string> {
+async function rpc(server: { url: string; token: string }, timeoutMs: number, method: string, params: unknown): Promise<any> {
   const resp = await fetch(server.url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${server.token}` },
     signal: AbortSignal.timeout(timeoutMs), // never hang session_start on a dead server
-    body: JSON.stringify({
-      jsonrpc: "2.0", id: 1, method: "tools/call",
-      params: { name: method, arguments: args },
-    }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
-  const data: any = await resp.json();
+  return resp.json();
+}
+
+async function dmCall(server: { url: string; token: string }, timeoutMs: number, method: string, args: Record<string, unknown>): Promise<string> {
+  const data = await rpc(server, timeoutMs, "tools/call", { name: method, arguments: args });
   return data?.result?.content?.[0]?.text ?? "{}";
 }
 
@@ -157,9 +159,76 @@ async function recall(server: { url: string; token: string }, timeoutMs: number,
   return JSON.parse(text)?.results ?? [];
 }
 
+/** Parse an MCP tools/list result into registerable tool defs. */
+export function parseToolDefs(listResult: any): Array<{ name: string; description: string; schema: Record<string, unknown> }> {
+  const tools = listResult?.result?.tools ?? [];
+  return tools
+    .filter((t: any) => t?.name && typeof t.name === "string")
+    .map((t: any) => ({
+      name: t.name,
+      description: (t.description ?? "").slice(0, 500),
+      schema: (t.inputSchema ?? { type: "object" }) as Record<string, unknown>,
+    }));
+}
+
+/** Map an MCP tools/call result to a pi tool result. */
+export function mapMcpResult(result: any) {
+  const text = (result?.content ?? [])
+    .filter((c: any) => c?.type === "text")
+    .map((c: any) => c.text)
+    .join("\n");
+  return {
+    content: [{ type: "text" as const, text: text || "(empty result)" }],
+    details: {},
+    isError: result?.isError === true,
+  };
+}
+
+// True when the user manages dense-mem via mcp.json — pi's own MCP client already
+// exposes the tools there, so the plugin must not double-register them.
+function mcpManagesDenseMem(): boolean {
+  try {
+    const mcp = JSON.parse(readFileSync(join(getAgentDir(), "mcp.json"), "utf-8"));
+    return Boolean(mcp.mcpServers?.["dense-mem"]);
+  } catch {
+    return false;
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const cfg = resolveConfig(ctx.cwd);
+
+    // Self-contained tool injection: discover the server's tools and register them,
+    // unless mcp.json already manages the dense-mem server (no duplicates).
+    if (cfg.server?.url && cfg.server?.token && !mcpManagesDenseMem()) {
+      try {
+        const list = await rpc(cfg.server, cfg.timeoutMs!, "tools/list", {});
+        for (const def of parseToolDefs(list)) {
+          const snippet = def.description.split("\n")[0].slice(0, 120);
+          pi.registerTool({
+            name: def.name,
+            label: def.name,
+            description: def.description || "(no description)",
+            promptSnippet: snippet || def.name,
+            parameters:
+              typeof (Type as any).Unsafe === "function"
+                ? (Type as any).Unsafe(def.schema)
+                : def.schema,
+            async execute(_toolCallId, params) {
+              const res = await rpc(cfg.server, cfg.timeoutMs!, "tools/call", {
+                name: def.name,
+                arguments: params ?? {},
+              });
+              return mapMcpResult(res?.result);
+            },
+          });
+        }
+      } catch {
+        // server unreachable — tools skipped; context recall below still runs
+      }
+    }
+
     if (!cfg.server?.url || !cfg.server?.token) return;
 
     const queries = readQueries(cfg.queriesFile);

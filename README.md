@@ -67,6 +67,23 @@ Overwrite per-user via `systemPromptFile` / `queriesFile` in the config — no n
 
 When a session runs inside a git repo, the hook detects the repo name and appends a generated, **non-editable** block to the system prompt (`## Current Repository`) instructing the agent to include the repo name in `remember()` calls and prefix `recall_memory()` queries with it. Recall at session start is likewise scoped (`[repo-name] query`). This block is code-generated on purpose so it can't be accidentally edited away — it's what keeps memories from different repos from bleeding together.
 
+### Self-contained tools (no mcp.json needed)
+
+At session start the plugin discovers the server's tools (`tools/list`) and registers them as regular pi tools — no `mcp.json` entry required. This is the fully self-contained path for a user who only runs dense-mem via this plugin:
+
+```json
+{ "server": { "url": "http://your-server:8080/mcp", "token": "dm_<profile-token>" } }
+```
+
+**To avoid double-registration, the plugin skips injection when `mcp.json` contains a `dense-mem` server entry** — pi's own MCP client owns the tools there. Remove that entry to let the plugin own them:
+
+```bash
+# keep tools from the plugin instead of pi's MCP client
+# (edit ~/.pi/agent/mcp.json and delete the dense-mem block)
+```
+
+Trade-off: pi's MCP client has a richer result surface (streaming, structured details); the plugin's injected tools proxy `tools/call` and return text content — identical for dense-mem's JSON-text results, and it uses the same `timeoutMs`. Discovery happens per session start; a dead server just means no tools (and no hang).
+
 ## Development
 
 - `extensions/dense-mem-hooks.ts` — the whole hook, one file.
