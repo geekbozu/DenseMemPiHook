@@ -23,6 +23,7 @@ Be specific and concrete. Save facts like:
 - Before answering a question where context would help
 - When you need to check if something was decided before
 - When the user references a topic you might have discussed
+- Query by concrete topic (entities, project names, decisions) — recall has no recency ranking, so avoid time words like "recent" or "last session"
 
 ### Quality over quantity
 

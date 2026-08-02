@@ -63,6 +63,10 @@ The defaults ship as editable markdown in this repo:
 
 Overwrite per-user via `systemPromptFile` / `queriesFile` in the config — no need to fork the package.
 
+### Repo awareness (non-editable)
+
+When a session runs inside a git repo, the hook detects the repo name and appends a generated, **non-editable** block to the system prompt (`## Current Repository`) instructing the agent to include the repo name in `remember()` calls and prefix `recall_memory()` queries with it. Recall at session start is likewise scoped (`[repo-name] query`). This block is code-generated on purpose so it can't be accidentally edited away — it's what keeps memories from different repos from bleeding together.
+
 ## Development
 
 - `extensions/dense-mem-hooks.ts` — the whole hook, one file.

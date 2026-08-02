@@ -82,13 +82,60 @@ export function readSystemPrompt(overrideAbs?: string): string | undefined {
   }
 }
 
-function detectRepo(cwd: string): string | undefined {
+// Injection-time noise: recall lexically matches these session-close/test/debug
+// markers (it has no recency ranking), so they are not real memory.
+const GARBAGE_PATTERNS = [
+  /session completed/i,
+  /memory context from previous sessions/i,
+  /this is a test/i,
+  /testing if the dense-mem/i,
+  /debugging why dense-mem/i,
+];
+
+export function isGarbage(c: string): boolean {
+  return GARBAGE_PATTERNS.some((re) => re.test(c));
+}
+
+// Near-duplicate check: normalized 80-char prefix. Mutates `seen`; returns true
+// for empty input and anything already (near-)seen.
+export function isDuplicate(c: string, seen: Set<string>): boolean {
+  const key = c.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 80);
+  if (!key || seen.has(key)) return true;
+  seen.add(key);
+  return false;
+}
+
+// Non-editable repo block: generated from git detection, appended after the editable prompt file.
+const REPO_PROMPT = (repo: string) =>
+  `## Current Repository\n\nRepository: ${repo}\n\n` +
+  `When calling remember(), include the repository name so memories are scoped to this repo. ` +
+  `When calling recall_memory(), prefix queries with the repository name.\n`;
+
+/** Build the system prompt appendix: editable prompt file (if any) + non-editable repo block (if repo detected). */
+export function buildSystemPrompt(base: string, cfg: HookConfig, repo?: string): string | undefined {
+  const editable = readSystemPrompt(cfg.systemPromptFile);
+  const parts = [editable, repo ? REPO_PROMPT(repo) : undefined].filter(Boolean) as string[];
+  if (parts.length === 0) return undefined;
+  return `${base}\n\n${parts.join("\n\n")}`;
+}
+
+export function detectRepo(cwd: string): string | undefined {
   try {
     const root = execSync("git rev-parse --show-toplevel", { cwd, timeout: 3000, encoding: "utf-8" }).trim();
     return root ? basename(root) : undefined;
   } catch {
     return;
   }
+}
+
+// detectRepo shells out per call; cache per cwd (extensions reload on session switch, so no staleness).
+let cachedCwd: string | undefined;
+let cachedRepo: string | undefined;
+function detectRepoCached(cwd: string): string | undefined {
+  if (cachedCwd === cwd) return cachedRepo;
+  cachedCwd = cwd;
+  cachedRepo = detectRepo(cwd);
+  return cachedRepo;
 }
 
 async function dmCall(server: { url: string; token: string }, timeoutMs: number, method: string, args: Record<string, unknown>): Promise<string> {
@@ -118,15 +165,17 @@ export default function (pi: ExtensionAPI) {
     const queries = readQueries(cfg.queriesFile);
     if (queries.length === 0) return;
 
-    const repo = detectRepo(ctx.cwd);
+    const repo = detectRepoCached(ctx.cwd);
     const scoped = (q: string) => (repo ? `[${repo}] ${q}` : q);
 
     try {
+      const seen = new Set<string>();
       const all: string[] = [];
       for (const q of queries) {
         for (const r of await recall(cfg.server, cfg.timeoutMs!, scoped(q))) {
           const c = (r.context ?? r.content ?? "").trim();
-          if (c && !all.includes(c)) all.push(c);
+          if (!c || isGarbage(c) || isDuplicate(c, seen)) continue;
+          all.push(c);
         }
       }
       if (all.length === 0) return;
@@ -142,9 +191,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    const cfg = resolveConfig(ctx.cwd);
-    const sysPrompt = readSystemPrompt(cfg.systemPromptFile);
-    if (!sysPrompt) return;
-    return { systemPrompt: `${event.systemPrompt}\n\n${sysPrompt}` };
+    const built = buildSystemPrompt(event.systemPrompt, resolveConfig(ctx.cwd), detectRepoCached(ctx.cwd));
+    if (!built) return;
+    return { systemPrompt: built };
   });
 }

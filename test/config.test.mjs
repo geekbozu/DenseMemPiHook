@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
-const { resolveConfig, readQueries, readSystemPrompt } = await import("../extensions/dense-mem-hooks.ts");
+const { resolveConfig, readQueries, readSystemPrompt, isGarbage, isDuplicate, buildSystemPrompt, detectRepo } = await import("../extensions/dense-mem-hooks.ts");
 
 // Scratch agent dir per test so config layers are fully controlled.
 function makeAgentDir() {
@@ -27,9 +27,9 @@ test("no config anywhere -> empty server, defaults, shipped prompts", () => {
   assert.equal(cfg.maxContextEntries, 8);
   assert.ok(readSystemPrompt(cfg.systemPromptFile).includes("Memory System Instructions"));
   assert.deepEqual(readQueries(cfg.queriesFile), [
-    "recent conversations, active projects, and current tasks",
-    "user preferences, workflow, and how they like things done",
-    "architecture decisions, tech stack, and design patterns",
+    "project goals, tasks, and named decisions",
+    "user preferences, workflow, and conventions",
+    "architecture, tech stack, and design patterns",
   ]);
   rmSync(agent, { recursive: true, force: true });
   rmSync(cwd, { recursive: true, force: true });
@@ -98,4 +98,53 @@ test("queries parsing: comments, blanks, and whitespace are ignored", () => {
   assert.deepEqual(readQueries(resolveConfig(cwd).queriesFile), ["first query", "second"]);
   rmSync(agent, { recursive: true, force: true });
   rmSync(cwd, { recursive: true, force: true });
+});
+
+test("garbage filter: session-close, test, and debug markers are noise", () => {
+  for (const g of [
+    "Session completed with pi-coding-agent",
+    "[Memory context from previous sessions:] something",
+    "this is a test, testing if the dense-mem works",
+    "debugging why dense-mem processing pipeline is stuck",
+  ]) {
+    assert.ok(isGarbage(g), `should be garbage: ${g}`);
+  }
+  assert.ok(!isGarbage("User prefers pnpm over npm"));
+  assert.ok(!isGarbage("The project uses SolidJS with Tailwind v4"));
+});
+
+test("dedupe: exact and near-duplicates via normalized 80-char prefix", () => {
+  const shared = "User prefers pnpm over npm for package management and likes fast tooling in every project, but tolerates slow CI when ";
+  const seen = new Set();
+  const a = shared + "it is a legacy monorepo";
+  assert.equal(isDuplicate(a, seen), false);
+  assert.equal(isDuplicate(a, seen), true, "exact repeat is duplicate");
+  const b = shared + "it is a brand new codebase";
+  assert.equal(isDuplicate(b, seen), true, "same 80-char prefix is near-duplicate");
+  const seen2 = new Set();
+  isDuplicate("Foo  Bar baz", seen2);
+  assert.equal(isDuplicate("foo bar baz", seen2), true, "whitespace/case normalization");
+  assert.equal(isDuplicate("", seen2), true, "empty is skipped");
+});
+
+test("repo-aware system prompt: non-editable repo block appended after editable prompt", () => {
+  const agent = makeAgentDir();
+  const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
+  const cfg = resolveConfig(cwd);
+  const built = buildSystemPrompt("BASE", cfg, "myrepo");
+  assert.ok(built.startsWith("BASE"));
+  assert.ok(built.includes("## Current Repository"));
+  assert.ok(built.includes("Repository: myrepo"));
+  assert.ok(built.includes("include the repository name so memories are scoped to this repo"));
+  assert.ok(built.includes("Memory System Instructions"), "editable prompt file still appended");
+  const noRepo = buildSystemPrompt("BASE", cfg, undefined);
+  assert.ok(noRepo.includes("Memory System Instructions"));
+  assert.ok(!noRepo.includes("Current Repository"), "no repo block outside a repo");
+  rmSync(agent, { recursive: true, force: true });
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test("detectRepo returns the git root basename inside a repo", () => {
+  assert.equal(detectRepo(process.cwd()), "DenseMemPiHook");
+  assert.equal(detectRepo(join(tmpdir(), "no-such-dir-xyz")), undefined);
 });
