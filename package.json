@@ -5,6 +5,9 @@
   "keywords": ["pi-package", "dense-mem", "memory"],
   "license": "MIT",
   "type": "module",
+  "scripts": {
+    "test": "node --test --import ./test/stub-pi.mjs test/config.test.mjs"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },

@@ -35,6 +35,25 @@ Per-user config lives in `~/.pi/agent/extensions/dense-mem-hooks.json` (same pat
 - **`maxContextEntries`** — how many memory snippets get injected (default `8`).
 - **`systemPromptFile` / `queriesFile`** — override the shipped prompt files. Relative paths resolve against the config file's directory.
 
+## Repo-level overrides & teams
+
+Drop a `.pi/dense-mem-hooks.json` inside any repo to override the global config for that repo only. Fields merge per-layer (repo wins), and `server` merges field-by-field, so a repo can override just the token:
+
+```json
+// <repo>/.pi/dense-mem-hooks.json
+{
+  "server": { "token": "dm_other-team-profile-token" },
+  "queriesFile": "prompts/queries.md",
+  "systemPromptFile": "prompts/team-prompt.md"
+}
+```
+
+Effective resolution per field: repo `.pi/dense-mem-hooks.json` > global `~/.pi/agent/extensions/dense-mem-hooks.json` > `mcp.json` (server only). Relative prompt paths resolve against the config file they came from (`<repo>/.pi/` for repo configs), so prompt overrides can live inside the repo and be shared.
+
+**Teams:** Dense-Mem scopes memory to the team carried by the profile token. One team today = one global token. When you add teams, each repo gets its own token via `server.token` above — the same hook, no code changes. `server.url` only needs overriding when teams run on different servers.
+
+> **Secret hygiene:** `server.token` is a credential. If a repo config needs a token, gitignore it (`.pi/dense-mem-hooks.json` in that repo's `.gitignore`) or commit only prompt/query overrides and keep tokens in the global config.
+
 ## Editing prompts
 
 The defaults ship as editable markdown in this repo:

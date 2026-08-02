@@ -2,15 +2,17 @@ import { readFileSync, existsSync } from "node:fs";
 import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // This extension's own directory (resolves correctly under jiti) — prompts/ ships next to extensions/.
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Sidecar config, same pattern as pi-model-sort.json: ~/.pi/agent/extensions/dense-mem-hooks.json
-const CONFIG_PATH = join(getAgentDir(), "extensions", "dense-mem-hooks.json");
+// Config layers, highest priority last: repo (.pi/dense-mem-hooks.json) > global (~/.pi/agent/extensions/) > mcp.json (server only).
+// Both paths are resolved lazily so getAgentDir() is read at use time.
+const GLOBAL_CONFIG_PATH = () => join(getAgentDir(), "extensions", "dense-mem-hooks.json");
+const REPO_CONFIG_PATH = (cwd: string) => join(cwd, CONFIG_DIR_NAME, "dense-mem-hooks.json");
 
-interface HookConfig {
+export interface HookConfig {
   server?: { url?: string; token?: string };
   timeoutMs?: number;
   maxContextEntries?: number;
@@ -20,53 +22,64 @@ interface HookConfig {
 
 const DEFAULTS = { timeoutMs: 5000, maxContextEntries: 8 };
 
-function loadConfig(): HookConfig {
+function readJson(p: string): HookConfig | undefined {
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as HookConfig;
+    return JSON.parse(readFileSync(p, "utf-8")) as HookConfig;
   } catch {
-    return {}; // no config — defaults + shipped prompts
+    return undefined; // missing or invalid — layer skipped
   }
 }
 
-const cfg = loadConfig();
-
-// Server config: config file wins, else the dense-mem entry in mcp.json. Never hardcoded.
-function resolveServer(): { url?: string; token?: string } {
-  if (cfg.server?.url && cfg.server?.token) return { url: cfg.server.url, token: cfg.server.token };
-  try {
-    const mcp = JSON.parse(readFileSync(join(getAgentDir(), "mcp.json"), "utf-8"));
-    const dm = mcp.mcpServers?.["dense-mem"];
-    if (dm?.url && dm?.bearerToken) return { url: dm.url, token: dm.bearerToken };
-  } catch {
-    // no mcp.json or dense-mem not configured
-  }
-  return {};
+// Resolve a layer's relative prompt paths against the directory of the file they came from.
+function absolutize(cfg: HookConfig, baseDir: string): HookConfig {
+  const abs = (p?: string) => (p ? (isAbsolute(p) ? p : resolve(baseDir, p)) : undefined);
+  return { ...cfg, systemPromptFile: abs(cfg.systemPromptFile), queriesFile: abs(cfg.queriesFile) };
 }
 
-const server = resolveServer();
-const timeoutMs = cfg.timeoutMs ?? DEFAULTS.timeoutMs;
-const maxEntries = cfg.maxContextEntries ?? DEFAULTS.maxContextEntries;
+/** Resolve effective config for a cwd: repo overrides global, server fields merge per-layer, mcp.json fills gaps. */
+export function resolveConfig(cwd: string): HookConfig {
+  const global = absolutize(readJson(GLOBAL_CONFIG_PATH()) ?? {}, dirname(GLOBAL_CONFIG_PATH()));
+  const repo = absolutize(readJson(REPO_CONFIG_PATH(cwd)) ?? {}, join(cwd, CONFIG_DIR_NAME));
+  const cfg: HookConfig = {
+    ...global,
+    ...repo,
+    server: { ...global.server, ...repo.server },
+    timeoutMs: repo.timeoutMs ?? global.timeoutMs ?? DEFAULTS.timeoutMs,
+    maxContextEntries: repo.maxContextEntries ?? global.maxContextEntries ?? DEFAULTS.maxContextEntries,
+  };
+  if (!cfg.server?.url || !cfg.server?.token) {
+    const mcp = readJson(join(getAgentDir(), "mcp.json")) as HookConfig & { mcpServers?: Record<string, { url?: string; bearerToken?: string }> };
+    const dm = mcp?.mcpServers?.["dense-mem"];
+    cfg.server = {
+      url: cfg.server?.url ?? dm?.url,
+      token: cfg.server?.token ?? dm?.bearerToken,
+    };
+  }
+  return cfg;
+}
 
-// Prompt source: config override (absolute, or relative to the config file) wins,
-// else the shipped prompts/ directory. Returns undefined if missing — hook no-ops.
-function readPrompt(rel: string, override?: string): string | undefined {
-  const p = override
-    ? (isAbsolute(override) ? override : resolve(dirname(CONFIG_PATH), override))
-    : join(EXT_DIR, "..", "prompts", rel);
+/** Read queries from a file (override or shipped prompts/queries.md). One per line, # comments and blanks ignored. */
+export function readQueries(overrideAbs?: string): string[] {
+  const p = overrideAbs ?? join(EXT_DIR, "..", "prompts", "queries.md");
+  try {
+    if (!existsSync(p)) return [];
+    return readFileSync(p, "utf-8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+/** Read the system prompt appendix from a file (override or shipped prompts/system-prompt.md). */
+export function readSystemPrompt(overrideAbs?: string): string | undefined {
+  const p = overrideAbs ?? join(EXT_DIR, "..", "prompts", "system-prompt.md");
   try {
     return existsSync(p) ? readFileSync(p, "utf-8").trim() : undefined;
   } catch {
     return undefined;
   }
-}
-
-function readQueries(override?: string): string[] {
-  const raw = readPrompt("queries.md", override);
-  if (!raw) return [];
-  return raw
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith("#"));
 }
 
 function detectRepo(cwd: string): string | undefined {
@@ -78,10 +91,10 @@ function detectRepo(cwd: string): string | undefined {
   }
 }
 
-async function dmCall(method: string, args: Record<string, unknown>): Promise<string> {
-  const resp = await fetch(server.url!, {
+async function dmCall(server: { url: string; token: string }, timeoutMs: number, method: string, args: Record<string, unknown>): Promise<string> {
+  const resp = await fetch(server.url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${server.token!}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${server.token}` },
     signal: AbortSignal.timeout(timeoutMs), // never hang session_start on a dead server
     body: JSON.stringify({
       jsonrpc: "2.0", id: 1, method: "tools/call",
@@ -92,14 +105,15 @@ async function dmCall(method: string, args: Record<string, unknown>): Promise<st
   return data?.result?.content?.[0]?.text ?? "{}";
 }
 
-async function recall(query: string, limit = 3) {
-  const text = await dmCall("recall_memory", { query, limit });
+async function recall(server: { url: string; token: string }, timeoutMs: number, query: string, limit = 3) {
+  const text = await dmCall(server, timeoutMs, "recall_memory", { query, limit });
   return JSON.parse(text)?.results ?? [];
 }
 
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
-    if (!server.url || !server.token) return;
+    const cfg = resolveConfig(ctx.cwd);
+    if (!cfg.server?.url || !cfg.server?.token) return;
 
     const queries = readQueries(cfg.queriesFile);
     if (queries.length === 0) return;
@@ -110,7 +124,7 @@ export default function (pi: ExtensionAPI) {
     try {
       const all: string[] = [];
       for (const q of queries) {
-        for (const r of await recall(scoped(q))) {
+        for (const r of await recall(cfg.server, cfg.timeoutMs!, scoped(q))) {
           const c = (r.context ?? r.content ?? "").trim();
           if (c && !all.includes(c)) all.push(c);
         }
@@ -119,7 +133,7 @@ export default function (pi: ExtensionAPI) {
 
       pi.sendMessage({
         customType: "dense-mem-context",
-        content: `[Memory context from previous sessions:]\n${all.slice(0, maxEntries).join("\n\n")}`,
+        content: `[Memory context from previous sessions:]\n${all.slice(0, cfg.maxContextEntries).join("\n\n")}`,
         display: true,
       });
     } catch {
@@ -127,8 +141,9 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", async (event, _ctx) => {
-    const sysPrompt = readPrompt("system-prompt.md", cfg.systemPromptFile);
+  pi.on("before_agent_start", async (event, ctx) => {
+    const cfg = resolveConfig(ctx.cwd);
+    const sysPrompt = readSystemPrompt(cfg.systemPromptFile);
     if (!sysPrompt) return;
     return { systemPrompt: `${event.systemPrompt}\n\n${sysPrompt}` };
   });
