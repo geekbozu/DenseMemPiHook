@@ -58,7 +58,7 @@ Effective resolution per field: repo `.pi/dense-mem-hooks.json` > global `~/.pi/
 
 The defaults ship as editable markdown in this repo:
 
-- `prompts/system-prompt.md` — the memory instructions appended to the system prompt. Edit freely.
+- `prompts/system-prompt.md` — the memory instructions appended to the system prompt. Edit freely. Includes the recall-feedback contract: after every `recall_memory()` call the agent must submit a quality rating via `submit_recall_session_feedback()` (high/medium/low + comment) — that's the only feedback path, since the portals have no rating UI.
 - `prompts/queries.md` — recall queries, one per line. `#` comments and blank lines ignored. Queries are repo-scoped at runtime (`[repo-name] query`).
 
 Overwrite per-user via `systemPromptFile` / `queriesFile` in the config — no need to fork the package.
