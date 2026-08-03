@@ -25,6 +25,13 @@ Be specific and concrete. Save facts like:
 - When the user references a topic you might have discussed
 - Query by concrete topic (entities, project names, decisions) — recall has no recency ranking, so avoid time words like "recent" or "last session"
 
+### When to call submit_recall_session_feedback():
+
+- After EVERY recall_memory() call, rate the results: quality = high/medium/low, plus a one-line comment on whether the recalled evidence was relevant/useful
+- This is the ONLY feedback path — the Dense-Mem portals have no rating UI, so the control portal Feedback tab stays empty until the agent (you) rates recalls
+- Call it even for bad results — a low rating is valid feedback that helps tune recall
+- The profile token must have write scope for the call to succeed (read-only tokens are rejected)
+
 ### Quality over quantity
 
 - Every remember() call costs a small amount in LLM pipeline time
