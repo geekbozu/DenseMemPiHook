@@ -15,6 +15,7 @@ const REPO_CONFIG_PATH = (cwd: string) => join(cwd, CONFIG_DIR_NAME, "dense-mem-
 
 export interface HookConfig {
   server?: { url?: string; token?: string };
+  repoName?: string; // override the detected repo name used for memory scoping
   timeoutMs?: number;
   maxContextChars?: number;
   recallLimit?: number;
@@ -75,6 +76,7 @@ export function resolveConfig(cwd: string): HookConfig {
     ...global,
     ...repo,
     server: { ...global.server, ...repo.server },
+    repoName: repo.repoName, // repo-scoped only: a global name for every repo makes no sense
     timeoutMs: repo.timeoutMs ?? global.timeoutMs ?? DEFAULTS.timeoutMs,
     maxContextChars: repo.maxContextChars ?? global.maxContextChars ?? DEFAULTS.maxContextChars,
     recallLimit: repo.recallLimit ?? global.recallLimit ?? DEFAULTS.recallLimit,
@@ -270,7 +272,7 @@ export default function (pi: ExtensionAPI) {
     const queries = readQueries(cfg.queriesFile);
     if (queries.length === 0) return;
 
-    const repo = detectRepoCached(ctx.cwd);
+    const repo = cfg.repoName ?? detectRepoCached(ctx.cwd);
     const scoped = (q: string) => (repo ? `[${repo}] ${q}` : q);
 
     try {
@@ -306,7 +308,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    const built = buildSystemPrompt(event.systemPrompt, resolveConfig(ctx.cwd), detectRepoCached(ctx.cwd));
+    const cfg = resolveConfig(ctx.cwd);
+    const built = buildSystemPrompt(event.systemPrompt, cfg, cfg.repoName ?? detectRepoCached(ctx.cwd));
     if (!built) return;
     return { systemPrompt: built };
   });

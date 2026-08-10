@@ -7,6 +7,7 @@
   }
 
   // Optional overrides — uncomment to use. Defaults are shown.
+  // "repoName": "my-repo",      // memory-scoping name when the git repo basename is generic/noisy (repo config only)
   // "timeoutMs": 5000,          // per-recall timeout in ms; session_start never hangs past this
   // "maxContextChars": 12000,   // total char budget for injected snippets (~4 chars/token)
   // "recallLimit": 10,          // per-query recall size before dedupe (server default is 10)
