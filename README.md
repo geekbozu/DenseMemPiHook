@@ -53,6 +53,7 @@ Per-user config lives in `~/.pi/agent/extensions/dense-mem-hooks.json` (same pat
 ```json
 {
   "server": { "url": "https://mem.example.com/mcp", "token": "dm_your-profile-token-here" },
+  "repoName": "my-repo",
   "timeoutMs": 5000,
   "maxContextChars": 12000,
   "recallLimit": 10,
@@ -64,6 +65,7 @@ Per-user config lives in `~/.pi/agent/extensions/dense-mem-hooks.json` (same pat
 Copy the example to `~/.pi/agent/extensions/dense-mem-hooks.json` (or `<repo>/.pi/dense-mem-hooks.json` for a repo-scoped override) and edit. **JSONC is supported: `//` line and `/* */` block comments are stripped before parsing (string-aware, so URLs like `https://...` are safe).** Trailing commas are not supported. Relative `systemPromptFile`/`queriesFile` paths resolve against the config file's directory (`~/.pi/agent/extensions/` or `<repo>/.pi/` respectively).
 
 - **`server`** — overrides the dense-mem connection. If absent, the hook reads the `dense-mem` entry from `~/.pi/agent/mcp.json`.
+- **`repoName`** — replaces the git-root basename used for memory scoping (`[repo] ` query prefix and the `Repository:` system-prompt block). Set it when the repo's directory name is generic or noisy (e.g. a monorepo checked out as `web`). Repo config only — a global name for every repo makes no sense, so it's ignored there.
 - **`timeoutMs`** — per-recall timeout (default `5000`). The hook never hangs `session_start` when the server is down — it gives up and lets the agent recall via tools.
 - **`maxContextChars`** — total char budget for injected memory snippets (default `4096`, ≈1k tokens). A char budget instead of an entry count because snippet length varies wildly (~150–900 chars).
 - **`recallLimit`** — per-query recall size before dedupe (default `10`, the server's own default). Raise it if the injected context looks thin; `maxContextChars` still caps the total.

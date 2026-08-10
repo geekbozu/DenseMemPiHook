@@ -81,6 +81,21 @@ test("repo prompt override wins for system prompt injection", () => {
   rmSync(cwd, { recursive: true, force: true });
 });
 
+test("repoName: repo config overrides detection, global is ignored", () => {
+  const agent = makeAgentDir();
+  write(join(agent, "extensions", "dense-mem-hooks.json"), JSON.stringify({ repoName: "global-name" }));
+  const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
+  const noRepoOverride = resolveConfig(cwd);
+  assert.equal(noRepoOverride.repoName, undefined, "global repoName is ignored");
+  write(join(cwd, ".pi", "dense-mem-hooks.json"), JSON.stringify({ repoName: "app-backend" }));
+  const cfg = resolveConfig(cwd);
+  assert.equal(cfg.repoName, "app-backend");
+  // repoName feeds the scoping path (repo ?? detected) in both handlers
+  assert.ok(buildSystemPrompt("BASE", cfg, cfg.repoName).includes("Repository: app-backend"));
+  rmSync(agent, { recursive: true, force: true });
+  rmSync(cwd, { recursive: true, force: true });
+});
+
 test("mcp.json fills server gaps when no config sets server", () => {
   const agent = makeAgentDir();
   write(join(agent, "mcp.json"), JSON.stringify({
