@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
-const { resolveConfig, readQueries, readSystemPrompt, isGarbage, isDuplicate, buildSystemPrompt, detectRepo } = await import("../extensions/dense-mem-hooks.ts");
+const { resolveConfig, readQueries, readSystemPrompt, isGarbage, isDuplicate, buildSystemPrompt, detectRepo, stripJsonComments } = await import("../extensions/dense-mem-hooks.ts");
 
 // Scratch agent dir per test so config layers are fully controlled.
 function makeAgentDir() {
@@ -24,7 +25,8 @@ test("no config anywhere -> empty server, defaults, shipped prompts", () => {
   const cfg = resolveConfig(cwd);
   assert.equal(cfg.server?.url, undefined);
   assert.equal(cfg.timeoutMs, 5000);
-  assert.equal(cfg.maxContextEntries, 8);
+  assert.equal(cfg.maxContextChars, 4096);
+  assert.equal(cfg.recallLimit, 10);
   assert.ok(readSystemPrompt(cfg.systemPromptFile).includes("Memory System Instructions"));
   assert.deepEqual(readQueries(cfg.queriesFile), [
     "project goals, tasks, and named decisions",
@@ -40,7 +42,8 @@ test("repo config overrides global per-field, server fields merge", () => {
   write(join(agent, "extensions", "dense-mem-hooks.json"), JSON.stringify({
     server: { url: "http://global:1/mcp", token: "dm_global" },
     timeoutMs: 3000,
-    maxContextEntries: 4,
+    maxContextChars: 2048,
+    recallLimit: 20,
   }));
   const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
   write(join(cwd, ".pi", "dense-mem-hooks.json"), JSON.stringify({
@@ -53,7 +56,8 @@ test("repo config overrides global per-field, server fields merge", () => {
   assert.equal(cfg.server.url, "http://global:1/mcp");
   assert.equal(cfg.server.token, "dm_repo_token");
   assert.equal(cfg.timeoutMs, 3000); // from global
-  assert.equal(cfg.maxContextEntries, 4); // from global
+  assert.equal(cfg.maxContextChars, 2048); // from global
+  assert.equal(cfg.recallLimit, 20); // from global
   // relative queriesFile resolved against the repo .pi dir
   assert.equal(cfg.queriesFile, join(cwd, ".pi", "queries-custom.md"));
   assert.deepEqual(readQueries(cfg.queriesFile), ["repo-only query"]);
@@ -142,6 +146,32 @@ test("repo-aware system prompt: non-editable repo block appended after editable 
   assert.ok(!noRepo.includes("Current Repository"), "no repo block outside a repo");
   rmSync(agent, { recursive: true, force: true });
   rmSync(cwd, { recursive: true, force: true });
+});
+
+test("stripJsonComments: JSONC comments removed, URLs and escapes in strings kept", () => {
+  const src = `{
+  // line comment
+  "url": "https://mem.example.com/mcp?q=a//b", /* block */
+  "s": "a /* not a comment */ b",
+  "esc": "say \\"hi\\"" // trailing
+}`;
+  const parsed = JSON.parse(stripJsonComments(src));
+  assert.equal(parsed.url, "https://mem.example.com/mcp?q=a//b");
+  assert.equal(parsed.s, "a /* not a comment */ b");
+  assert.equal(parsed.esc, 'say "hi"');
+});
+
+test("shipped example config parses (JSONC) with core fields active, options documented", () => {
+  const example = join(dirname(fileURLToPath(import.meta.url)), "..", "dense-mem-hooks.example.json");
+  const raw = readFileSync(example, "utf-8");
+  const cfg = JSON.parse(stripJsonComments(raw)); // strict JSON.parse after stripping — no comments allowed
+  assert.equal(cfg.server.url, "https://mem.example.com/mcp");
+  assert.equal(cfg.server.token, "dm_your-profile-token-here");
+  assert.deepEqual(Object.keys(cfg), ["server"], "only required fields active");
+  // optional knobs stay documented as comments so they don't silently drift
+  for (const key of ["timeoutMs", "maxContextChars", "recallLimit", "systemPromptFile", "queriesFile"]) {
+    assert.ok(raw.includes(key), `example documents ${key}`);
+  }
 });
 
 test("detectRepo returns the git root basename inside a repo", () => {
