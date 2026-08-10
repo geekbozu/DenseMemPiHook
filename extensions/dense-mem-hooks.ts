@@ -23,7 +23,7 @@ export interface HookConfig {
   queriesFile?: string;
 }
 
-const DEFAULTS = { timeoutMs: 5000, maxContextChars: 4096, recallLimit: 10 }; // recallLimit = server's own DefaultLimit; ~4 chars/token
+const DEFAULTS = { timeoutMs: 30000, maxContextChars: 4096, recallLimit: 10 }; // recallLimit = server's own DefaultLimit; ~4 chars/token
 
 // Strip // and /* */ comments outside strings so JSON.parse can read JSONC.
 // String-aware: "url": "https://..." must not be truncated at the //.
@@ -209,16 +209,23 @@ export function parseToolDefs(listResult: any): Array<{ name: string; descriptio
     }));
 }
 
-/** Map an MCP tools/call result to a pi tool result. */
-export function mapMcpResult(result: any) {
-  const text = (result?.content ?? [])
+/** Map an MCP tools/call response envelope to a pi tool result. JSON-RPC errors become real tool errors, not "(empty result)". */
+export function mapMcpResult(res: any) {
+  if (res?.error) {
+    return {
+      content: [{ type: "text" as const, text: `dense-mem error ${res.error.code}: ${res.error.message}` }],
+      details: {},
+      isError: true,
+    };
+  }
+  const text = (res?.result?.content ?? [])
     .filter((c: any) => c?.type === "text")
     .map((c: any) => c.text)
     .join("\n");
   return {
     content: [{ type: "text" as const, text: text || "(empty result)" }],
     details: {},
-    isError: result?.isError === true,
+    isError: res?.result?.isError === true,
   };
 }
 
@@ -258,7 +265,7 @@ export default function (pi: ExtensionAPI) {
                 name: def.name,
                 arguments: params ?? {},
               }, signal);
-              return mapMcpResult(res?.result);
+              return mapMcpResult(res); // full envelope: errors at res.error must surface, not vanish
             },
           });
         }

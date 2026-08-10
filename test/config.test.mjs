@@ -24,7 +24,7 @@ test("no config anywhere -> empty server, defaults, shipped prompts", () => {
   const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
   const cfg = resolveConfig(cwd);
   assert.equal(cfg.server?.url, undefined);
-  assert.equal(cfg.timeoutMs, 5000);
+  assert.equal(cfg.timeoutMs, 30000);
   assert.equal(cfg.maxContextChars, 4096);
   assert.equal(cfg.recallLimit, 10);
   assert.ok(readSystemPrompt(cfg.systemPromptFile).includes("Memory System Instructions"));
