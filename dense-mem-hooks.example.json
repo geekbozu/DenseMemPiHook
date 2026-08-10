@@ -1,0 +1,15 @@
+{
+  // REQUIRED: the dense-mem server connection. Omit this block entirely
+  // and the hook falls back to the "dense-mem" entry in ~/.pi/agent/mcp.json.
+  "server": {
+    "url": "https://mem.example.com/mcp",
+    "token": "dm_your-profile-token-here"
+  }
+
+  // Optional overrides — uncomment to use. Defaults are shown.
+  // "timeoutMs": 5000,          // per-recall timeout in ms; session_start never hangs past this
+  // "maxContextChars": 12000,   // total char budget for injected snippets (~4 chars/token)
+  // "recallLimit": 10,          // per-query recall size before dedupe (server default is 10)
+  // "systemPromptFile": "prompts/my-system-prompt.md", // relative to THIS config file's directory
+  // "queriesFile": "prompts/my-queries.md"
+}

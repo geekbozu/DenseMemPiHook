@@ -16,16 +16,46 @@ const REPO_CONFIG_PATH = (cwd: string) => join(cwd, CONFIG_DIR_NAME, "dense-mem-
 export interface HookConfig {
   server?: { url?: string; token?: string };
   timeoutMs?: number;
-  maxContextEntries?: number;
+  maxContextChars?: number;
+  recallLimit?: number;
   systemPromptFile?: string;
   queriesFile?: string;
 }
 
-const DEFAULTS = { timeoutMs: 5000, maxContextEntries: 8 };
+const DEFAULTS = { timeoutMs: 5000, maxContextChars: 4096, recallLimit: 10 }; // recallLimit = server's own DefaultLimit; ~4 chars/token
+
+// Strip // and /* */ comments outside strings so JSON.parse can read JSONC.
+// String-aware: "url": "https://..." must not be truncated at the //.
+export function stripJsonComments(src: string): string {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\") out += src[++i] ?? ""; // escaped char, e.g. \"
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; out += ch; continue; }
+    if (ch === "/" && src[i + 1] === "/") {
+      while (i < src.length && src[i] !== "\n") i++;
+      if (i < src.length) out += "\n"; // keep the newline so tokens don't merge
+      continue;
+    }
+    if (ch === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end === -1 ? src.length - 1 : end + 1; // for-loop i++ lands past */
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
 
 function readJson(p: string): HookConfig | undefined {
   try {
-    return JSON.parse(readFileSync(p, "utf-8")) as HookConfig;
+    return JSON.parse(stripJsonComments(readFileSync(p, "utf-8"))) as HookConfig;
   } catch {
     return undefined; // missing or invalid — layer skipped
   }
@@ -46,7 +76,8 @@ export function resolveConfig(cwd: string): HookConfig {
     ...repo,
     server: { ...global.server, ...repo.server },
     timeoutMs: repo.timeoutMs ?? global.timeoutMs ?? DEFAULTS.timeoutMs,
-    maxContextEntries: repo.maxContextEntries ?? global.maxContextEntries ?? DEFAULTS.maxContextEntries,
+    maxContextChars: repo.maxContextChars ?? global.maxContextChars ?? DEFAULTS.maxContextChars,
+    recallLimit: repo.recallLimit ?? global.recallLimit ?? DEFAULTS.recallLimit,
   };
   if (!cfg.server?.url || !cfg.server?.token) {
     const mcp = readJson(join(getAgentDir(), "mcp.json")) as HookConfig & { mcpServers?: Record<string, { url?: string; bearerToken?: string }> };
@@ -159,7 +190,7 @@ async function dmCall(server: { url: string; token: string }, timeoutMs: number,
   return data?.result?.content?.[0]?.text ?? "{}";
 }
 
-async function recall(server: { url: string; token: string }, timeoutMs: number, query: string, limit = 3) {
+async function recall(server: { url: string; token: string }, timeoutMs: number, query: string, limit = 10) {
   const text = await dmCall(server, timeoutMs, "recall_memory", { query, limit });
   return JSON.parse(text)?.results ?? [];
 }
@@ -246,7 +277,7 @@ export default function (pi: ExtensionAPI) {
       const seen = new Set<string>();
       const all: string[] = [];
       for (const q of queries) {
-        for (const r of await recall(cfg.server, cfg.timeoutMs!, scoped(q))) {
+        for (const r of await recall(cfg.server, cfg.timeoutMs!, scoped(q), cfg.recallLimit)) {
           const c = (r.context ?? r.content ?? "").trim();
           if (!c || isGarbage(c) || isDuplicate(c, seen)) continue;
           all.push(c);
@@ -254,9 +285,19 @@ export default function (pi: ExtensionAPI) {
       }
       if (all.length === 0) return;
 
+      // Char budget, not entry count: snippets vary ~150-900 chars, so a count
+      // cap makes context cost unpredictable. ~4 chars/token for English.
+      let budget = 0;
+      const capped: string[] = [];
+      for (const c of all) {
+        if (budget + c.length > cfg.maxContextChars) break;
+        capped.push(c);
+        budget += c.length;
+      }
+
       pi.sendMessage({
         customType: "dense-mem-context",
-        content: `[Memory context from previous sessions:]\n${all.slice(0, cfg.maxContextEntries).join("\n\n")}`,
+        content: `[Memory context from previous sessions:]\n${capped.join("\n\n")}`,
         display: true,
       });
     } catch {
