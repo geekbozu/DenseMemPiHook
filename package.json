@@ -1,6 +1,6 @@
 {
   "name": "dense-mem-hooks",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Pi extension: injects Dense-Mem context from previous sessions at session start and adds memory usage instructions to the system prompt.",
   "keywords": ["pi-package", "dense-mem", "memory"],
   "license": "MIT",

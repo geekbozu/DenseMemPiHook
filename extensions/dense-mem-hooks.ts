@@ -252,6 +252,48 @@ export function scopeEvidence(args: Record<string, unknown>, repo?: string): Rec
   };
 }
 
+// Repair hand-counted spans before submission: the server requires each surface
+// (subject.name / predicate.surface / object entity.name|value.surface) to equal the
+// exact Unicode code-point slice of its evidence content (Go runes, not UTF-16 units).
+// Rewrites the span from the verbatim surface; leaves it alone when the text isn't in
+// the content — that's a real semantic error and the server's message is the truth.
+export function normalizeSpans(evidence: unknown[], relationships: unknown[]): unknown[] {
+  if (!Array.isArray(evidence) || !Array.isArray(relationships)) return relationships;
+  const cpsOf = (idx: number): string[] | undefined => {
+    const e = evidence[idx] as { content?: unknown } | undefined;
+    return e && typeof e.content === "string" ? Array.from(e.content) : undefined;
+  };
+  const fixSurface = (holder: unknown, field: string) => {
+    const h = holder as { span?: { evidence_index?: number; start?: number; end?: number } } | undefined;
+    const span = h?.span;
+    const surface = (h as Record<string, unknown> | undefined)?.[field];
+    if (!span || typeof surface !== "string" || !surface) return;
+    const cps = cpsOf(span.evidence_index ?? -1);
+    if (!cps) return;
+    if (cps.slice(span.start ?? -1, span.end ?? -1).join("") === surface) return; // already exact
+    const needle = Array.from(surface);
+    const at = cps.findIndex((_, i) => needle.every((ch, j) => cps[i + j] === ch));
+    if (at < 0) return; // not verbatim — leave for the server to report
+    span.start = at;
+    span.end = at + needle.length;
+  };
+  const clampEnd = (s: unknown) => {
+    const sup = s as { evidence_index?: number; end?: number } | undefined;
+    const cps = cpsOf(sup?.evidence_index ?? -1);
+    if (!cps || typeof sup?.end !== "number") return;
+    if (sup.end > cps.length) sup.end = cps.length;
+  };
+  for (const rel of relationships) {
+    const r = rel as Record<string, unknown>;
+    fixSurface(r.subject, "name");
+    fixSurface(r.predicate, "surface");
+    fixSurface((r.object as Record<string, unknown> | undefined)?.entity, "name");
+    fixSurface((r.object as Record<string, unknown> | undefined)?.value, "surface");
+    if (Array.isArray(r.supports)) for (const s of r.supports) clampEnd(s);
+  }
+  return relationships;
+}
+
 // True when the user manages dense-mem via mcp.json — pi's own MCP client already
 // exposes the tools there, so the plugin must not double-register them.
 function mcpManagesDenseMem(): boolean {
@@ -285,9 +327,11 @@ export default function (pi: ExtensionAPI) {
                 ? (Type as any).Unsafe(def.schema)
                 : def.schema,
             async execute(_toolCallId, params, signal) {
-              const args = def.name.endsWith("remember")
-                ? scopeEvidence((params ?? {}) as Record<string, unknown>, repo)
-                : (params ?? {});
+              let args = (params ?? {}) as Record<string, unknown>;
+              if (def.name.endsWith("remember")) {
+                args = scopeEvidence(args, repo); // [repo] prefix + label
+                normalizeSpans(args.evidence as unknown[], args.relationships as unknown[]); // span shift from the prefix is repaired here too
+              }
               const res = await rpc(cfg.server, cfg.timeoutMs!, "tools/call", {
                 name: def.name,
                 arguments: args,

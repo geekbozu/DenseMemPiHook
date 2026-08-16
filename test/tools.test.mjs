@@ -207,11 +207,34 @@ test("remember tool call scopes evidence: [repo] prefix + repo label, idempotent
     await handlers.session_start({}, { cwd: dir });
 
     const remember = registered.find((t) => t.name === "dense_mem_remember");
-    await remember.execute("c1", { evidence: [{ content: "user prefers pnpm", labels: ["pref"] }] }, new AbortController().signal);
+    const rel = {
+      ref: "r1",
+      subject: { name: "user", entity_kind: "person", span: { evidence_index: 0, start: 0, end: 4 } }, // wrong: content is now "[MyRepo] user prefers pnpm"
+      predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { evidence_index: 0, start: 5, end: 30 } }, // wrong + overlong
+      object: { entity: { name: "pnpm", entity_kind: "product", span: { evidence_index: 0, start: 0, end: 4 } } }, // wrong
+      polarity: "+",
+      modality: "statement",
+      supports: [{ evidence_index: 0, start: 0, end: 999 }], // out of bounds → clamped
+    };
+    await remember.execute("c1", { evidence: [{ content: "user prefers pnpm", labels: ["pref"] }], relationships: [rel] }, new AbortController().signal);
     await remember.execute("c2", { evidence: [{ content: "[MyRepo] already anchored", labels: ["repo:MyRepo"] }] }, new AbortController().signal);
 
+    const tagged = "[MyRepo] user prefers pnpm"; // [MyRepo]=0..8, "user"=9..13, "prefers pnpm"=14..26, "pnpm"=22..26
     assert.deepEqual(captured, [
-      { evidence: [{ content: "[MyRepo] user prefers pnpm", labels: ["pref", "repo:MyRepo"] }] },
+      {
+        evidence: [{ content: tagged, labels: ["pref", "repo:MyRepo"] }],
+        relationships: [
+          {
+            ref: "r1",
+            subject: { name: "user", entity_kind: "person", span: { evidence_index: 0, start: 9, end: 13 } },
+            predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { evidence_index: 0, start: 14, end: 26 } },
+            object: { entity: { name: "pnpm", entity_kind: "product", span: { evidence_index: 0, start: 22, end: 26 } } },
+            polarity: "+",
+            modality: "statement",
+            supports: [{ evidence_index: 0, start: 0, end: 26 }],
+          },
+        ],
+      },
       { evidence: [{ content: "[MyRepo] already anchored", labels: ["repo:MyRepo"] }] }, // untouched: idempotent
     ]);
 
@@ -219,6 +242,36 @@ test("remember tool call scopes evidence: [repo] prefix + repo label, idempotent
   } finally {
     stopFakeMcp(server);
   }
+});
+
+test("normalizeSpans: repairs wrong spans, leaves exact/absent surfaces alone, code-point aware", async () => {
+  const { normalizeSpans } = await import("../extensions/dense-mem-hooks.ts");
+  const evidence = [{ content: "a😀b prefers pnpm" }]; // code points: a=0 😀=1 b=2 ' '=3 ...
+  const rels = [
+    {
+      subject: { name: "b", entity_kind: "concept", span: { evidence_index: 0, start: 4, end: 5 } }, // wrong: b is at 2
+      predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { evidence_index: 0, start: 0, end: 4 } }, // wrong
+      object: { entity: { name: "pnpm", entity_kind: "product", span: { evidence_index: 0, start: 10, end: 13 } } }, // wrong
+      supports: [{ evidence_index: 0, start: 0, end: 999 }],
+    },
+    {
+      subject: { name: "b", entity_kind: "concept", span: { evidence_index: 0, start: 2, end: 3 } }, // already exact
+      predicate: { proposed_key: "likes", surface: "does not appear", span: { evidence_index: 0, start: 2, end: 3 } }, // absent → untouched
+      object: { entity: { name: "a", entity_kind: "concept", span: { evidence_index: 0, start: 0, end: 1 } } },
+    },
+  ];
+  normalizeSpans(evidence, rels);
+  assert.deepEqual(rels[0], {
+    subject: { name: "b", entity_kind: "concept", span: { evidence_index: 0, start: 2, end: 3 } },
+    predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { evidence_index: 0, start: 4, end: 16 } }, // "prefers pnpm" starts after "a😀b "
+    object: { entity: { name: "pnpm", entity_kind: "product", span: { evidence_index: 0, start: 12, end: 16 } } },
+    supports: [{ evidence_index: 0, start: 0, end: 16 }],
+  });
+  assert.deepEqual(rels[1], {
+    subject: { name: "b", entity_kind: "concept", span: { evidence_index: 0, start: 2, end: 3 } },
+    predicate: { proposed_key: "likes", surface: "does not appear", span: { evidence_index: 0, start: 2, end: 3 } },
+    object: { entity: { name: "a", entity_kind: "concept", span: { evidence_index: 0, start: 0, end: 1 } } },
+  });
 });
 
 test("session_start survives a dead server: no tools, no crash", async () => {
