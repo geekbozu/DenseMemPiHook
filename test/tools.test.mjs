@@ -218,8 +218,17 @@ test("remember tool call scopes evidence: [repo] prefix + repo label, idempotent
     };
     await remember.execute("c1", { evidence: [{ content: "user prefers pnpm", labels: ["pref"] }], relationships: [rel] }, new AbortController().signal);
     await remember.execute("c2", { evidence: [{ content: "[MyRepo] already anchored", labels: ["repo:MyRepo"] }] }, new AbortController().signal);
+    // same content + relationships, different hand-counted spans → must hash to the same idempotency key
+    const relRetry = JSON.parse(JSON.stringify(rel));
+    relRetry.subject.span = { evidence_index: 0, start: 1, end: 2 };
+    relRetry.predicate.span = { evidence_index: 0, start: 3, end: 28 };
+    relRetry.object.entity.span = { evidence_index: 0, start: 5, end: 9 };
+    await remember.execute("c3", { evidence: [{ content: "user prefers pnpm", labels: ["pref"] }], relationships: [relRetry] }, new AbortController().signal);
 
     const tagged = "[MyRepo] user prefers pnpm"; // [MyRepo]=0..8, "user"=9..13, "prefers pnpm"=14..26, "pnpm"=22..26
+    assert.equal(captured[0].idempotency_key, captured[2].idempotency_key, "identical request after normalization → replay, no double ingest");
+    assert.notEqual(captured[1].idempotency_key, captured[0].idempotency_key, "different content → different key");
+    for (const c of captured) delete c.idempotency_key;
     assert.deepEqual(captured, [
       {
         evidence: [{ content: tagged, labels: ["pref", "repo:MyRepo"] }],
@@ -236,6 +245,20 @@ test("remember tool call scopes evidence: [repo] prefix + repo label, idempotent
         ],
       },
       { evidence: [{ content: "[MyRepo] already anchored", labels: ["repo:MyRepo"] }] }, // untouched: idempotent
+      {
+        evidence: [{ content: tagged, labels: ["pref", "repo:MyRepo"] }],
+        relationships: [
+          {
+            ref: "r1",
+            subject: { name: "user", entity_kind: "person", span: { evidence_index: 0, start: 9, end: 13 } },
+            predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { evidence_index: 0, start: 14, end: 26 } },
+            object: { entity: { name: "pnpm", entity_kind: "product", span: { evidence_index: 0, start: 22, end: 26 } } },
+            polarity: "+",
+            modality: "statement",
+            supports: [{ evidence_index: 0, start: 0, end: 26 }],
+          },
+        ],
+      },
     ]);
 
     cleanup([dir]);

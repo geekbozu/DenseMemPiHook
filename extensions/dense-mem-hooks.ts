@@ -1,4 +1,5 @@
 import { readFileSync, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
@@ -294,6 +295,30 @@ export function normalizeSpans(evidence: unknown[], relationships: unknown[]): u
   return relationships;
 }
 
+/** Deterministic JSON: key-sorted, so byte-identical requests hash identically
+ *  regardless of the agent's property order. */
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
+    return `{${Object.keys(obj).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+/** Stable submission key derived from the request itself: identical (post-normalization)
+ *  requests share a key, so the server's knowledge_ingests_idempotency_unique replays them
+ *  instead of double-ingesting — the retry cascade and re-stored facts stop doubling.
+ *  Same content + different relationship proposal still collides loudly (ErrIdempotencyConflict)
+ *  rather than silently duplicating. */
+export function requestIdempotencyKey(args: Record<string, unknown>): string | undefined {
+  if (!Array.isArray(args.evidence)) return undefined;
+  const sum = createHash("sha256")
+    .update(canonicalJson({ evidence: args.evidence, relationships: args.relationships }))
+    .digest("hex");
+  return `sha256:${sum}`;
+}
+
 // True when the user manages dense-mem via mcp.json — pi's own MCP client already
 // exposes the tools there, so the plugin must not double-register them.
 function mcpManagesDenseMem(): boolean {
@@ -331,6 +356,7 @@ export default function (pi: ExtensionAPI) {
               if (def.name.endsWith("remember")) {
                 args = scopeEvidence(args, repo); // [repo] prefix + label
                 normalizeSpans(args.evidence as unknown[], args.relationships as unknown[]); // span shift from the prefix is repaired here too
+                args.idempotency_key ??= requestIdempotencyKey(args); // identical requests replay server-side instead of double-ingesting
               }
               const res = await rpc(cfg.server, cfg.timeoutMs!, "tools/call", {
                 name: def.name,
