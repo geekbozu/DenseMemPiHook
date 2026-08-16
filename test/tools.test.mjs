@@ -181,6 +181,46 @@ test("injected tool: server JSON-RPC error surfaces as tool error, not (empty re
   cleanup([dir]);
 });
 
+test("remember tool call scopes evidence: [repo] prefix + repo label, idempotent", async () => {
+  const captured = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const msg = JSON.parse(body);
+      if (msg.method === "tools/call" && msg.params?.name === "dense_mem_remember") captured.push(msg.params.arguments);
+      const result = msg.method === "tools/list" ? { tools: TOOLS } : { content: [{ type: "text", text: "{}" }] };
+      res.setHeader("content-type", "application/json");
+      res.setHeader("connection", "close");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const dir = agentDirWith({
+      config: { server: { url: `http://127.0.0.1:${server.address().port}/mcp`, token: "dm_test" }, timeoutMs: 3000 },
+    });
+    mkdirSync(join(dir, ".pi"), { recursive: true });
+    writeFileSync(join(dir, ".pi", "dense-mem-hooks.json"), JSON.stringify({ repoName: "MyRepo" })); // repoName is repo-layer only
+    const { pi, handlers, registered } = makePi();
+    (await import("../extensions/dense-mem-hooks.ts")).default(pi);
+    await handlers.session_start({}, { cwd: dir });
+
+    const remember = registered.find((t) => t.name === "dense_mem_remember");
+    await remember.execute("c1", { evidence: [{ content: "user prefers pnpm", labels: ["pref"] }] }, new AbortController().signal);
+    await remember.execute("c2", { evidence: [{ content: "[MyRepo] already anchored", labels: ["repo:MyRepo"] }] }, new AbortController().signal);
+
+    assert.deepEqual(captured, [
+      { evidence: [{ content: "[MyRepo] user prefers pnpm", labels: ["pref", "repo:MyRepo"] }] },
+      { evidence: [{ content: "[MyRepo] already anchored", labels: ["repo:MyRepo"] }] }, // untouched: idempotent
+    ]);
+
+    cleanup([dir]);
+  } finally {
+    stopFakeMcp(server);
+  }
+});
+
 test("session_start survives a dead server: no tools, no crash", async () => {
   const dir = agentDirWith({
     config: { server: { url: "http://127.0.0.1:1/mcp", token: "dm_test" }, timeoutMs: 1000 },

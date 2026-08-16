@@ -229,6 +229,29 @@ export function mapMcpResult(res: any) {
   };
 }
 
+/** Anchor stored evidence to this repo: prefix content with [repo] (session_start recall
+ *  queries are prefixed identically) and add a repo:<name> label, so scoped recall can
+ *  lexically find it. Idempotent — already-tagged items pass through untouched. */
+export function scopeEvidence(args: Record<string, unknown>, repo?: string): Record<string, unknown> {
+  if (!repo || !Array.isArray(args.evidence)) return args;
+  const tag = `[${repo}] `;
+  const label = `repo:${repo}`;
+  return {
+    ...args,
+    evidence: args.evidence.map((e) => {
+      if (!e || typeof e !== "object") return e;
+      const ev = e as Record<string, unknown>;
+      const content = typeof ev.content === "string" ? ev.content : "";
+      const labels = Array.isArray(ev.labels) ? (ev.labels as string[]) : [];
+      return {
+        ...ev,
+        content: content.startsWith(tag) ? content : tag + content,
+        labels: labels.includes(label) ? labels : [...labels, label],
+      };
+    }),
+  };
+}
+
 // True when the user manages dense-mem via mcp.json — pi's own MCP client already
 // exposes the tools there, so the plugin must not double-register them.
 function mcpManagesDenseMem(): boolean {
@@ -249,6 +272,7 @@ export default function (pi: ExtensionAPI) {
     if (cfg.server?.url && cfg.server?.token && !mcpManagesDenseMem()) {
       try {
         const list = await rpc(cfg.server, cfg.timeoutMs!, "tools/list", {});
+        const repo = cfg.repoName ?? detectRepoCached(ctx.cwd); // anchor writes, not just recall queries
         for (const def of parseToolDefs(list)) {
           const snippet = def.description.split("\n")[0].slice(0, 120);
           pi.registerTool({
@@ -261,9 +285,12 @@ export default function (pi: ExtensionAPI) {
                 ? (Type as any).Unsafe(def.schema)
                 : def.schema,
             async execute(_toolCallId, params, signal) {
+              const args = def.name.endsWith("remember")
+                ? scopeEvidence((params ?? {}) as Record<string, unknown>, repo)
+                : (params ?? {});
               const res = await rpc(cfg.server, cfg.timeoutMs!, "tools/call", {
                 name: def.name,
-                arguments: params ?? {},
+                arguments: args,
               }, signal);
               return mapMcpResult(res); // full envelope: errors at res.error must surface, not vanish
             },
