@@ -4,8 +4,9 @@ Pi extension that makes Dense-Mem memory automatic across sessions:
 
 - **`session_start`** — recalls context from previous sessions (repo-scoped) and injects it as a message so the agent starts with memory.
 - **`before_agent_start`** — appends memory instructions (from `prompts/system-prompt.md`) to the system prompt.
+- **`tool_call`** — normalizes span offsets in `remember`/`correct_relationship` calls so the server accepts them on the first try.
 
-The Dense-Mem MCP tools themselves (`dense_mem_*`) come from your own MCP config — this hook only adds the automatic context + instructions on top.
+The Dense-Mem MCP tools themselves (`remember`, `recall_memory`, etc.) come from [pi-mcp-adapter](https://github.com/earendil-works/pi-mcp-adapter) via your `mcp.json` config — this hook only adds the automatic context + instructions + span normalization on top.
 
 ## What startup looks like
 
@@ -39,16 +40,40 @@ On a new session inside a git repo, two things happen before you type a word:
 
 ## Install
 
-```bash
-pi install git:github.com/geekbozu/DenseMemPiHook   # or a local path:
-pi install /path/to/DenseMemPiHook
+### 1. Configure dense-mem in mcp.json
+
+Add the dense-mem server to `~/.pi/agent/mcp.json` so pi-mcp-adapter exposes the tools:
+
+```json
+{
+  "mcpServers": {
+    "dense-mem": {
+      "url": "https://mem.example.com/mcp",
+      "auth": "bearer",
+      "bearerToken": "dm_your-profile-token-here"
+    }
+  }
+}
 ```
+
+### 2. Install this extension
+
+```bash
+pi install git:github.com/geekbozu/DenseMemPiHook
+```
+
+The extension will warn once at session start if it detects the server is configured but the MCP tools aren't available (e.g. pi-mcp-adapter not installed).
 
 > **Don't double-load:** if you previously copied the hook into `~/.pi/agent/extensions/`, remove that copy before installing the package, or the context injection and system prompt instructions run twice.
 
 ## Config
 
-Per-user config lives in `~/.pi/agent/extensions/dense-mem-hooks.json` (same pattern as `pi-model-sort.json`). All fields optional. A minimal starter with the required `server` block active and every option commented out ships at [`dense-mem-hooks.example.json`](dense-mem-hooks.example.json) — copy it, uncomment what you need. All fields at a glance:
+All fields are optional. The extension reads its own config for hook-specific settings (recall queries, system prompt, timeouts) from:
+
+- **Global:** `~/.pi/agent/extensions/dense-mem-hooks.json`
+- **Repo:** `.pi/dense-mem-hooks.json` (overrides global per-field)
+
+The MCP server connection comes from `mcp.json` (above). The hook config can optionally override it:
 
 ```json
 {
@@ -90,35 +115,35 @@ Effective resolution per field: repo `.pi/dense-mem-hooks.json` > global `~/.pi/
 
 > **Secret hygiene:** `server.token` is a credential. If a repo config needs a token, gitignore it (`.pi/dense-mem-hooks.json` in that repo's `.gitignore`) or commit only prompt/query overrides and keep tokens in the global config.
 
+## Known quirks
+
+### MCP tool-name prefixing
+
+pi-mcp-adapter registers MCP tools with a `<server-name>_` prefix (e.g. `dense-mem_remember` instead of `remember`). The prefix comes from the `mcpServers` key in your MCP config — rename the key and the tool names change. This extension handles it in two places:
+
+1. **Tool detection** (`DENSE_MEM_TOOL_STEMS`) — matches by suffix (`endsWith("_remember")`) so any prefix works.
+2. **System prompt / repo block** — uses unprefixed short names (`remember`, `recall_memory`) with an explicit note telling the LLM to call the actual prefixed tools from its tool list.
+
+If you rename the MCP server key (e.g. `"dense-mem"` → `"dm"`), the extension adapts automatically. The system prompt instructions remain valid because they tell the LLM to use whatever tool names it sees, not hardcoded ones.
+
+**Fragility caveat:** The non-editable repo block and shipped prompts use short names as a readability convention. If a future MCP adapter changes the prefix convention, the prompts still work (the LLM maps names from its tool list), but the `tool_call` hook's suffix matching would need updating if the prefix format changes.
+
 ## Editing prompts
 
 The defaults ship as editable markdown in this repo:
 
-- `prompts/system-prompt.md` — the memory instructions appended to the system prompt. Edit freely. Includes the recall-feedback contract: after every `recall_memory()` call the agent must submit a quality rating via `submit_recall_session_feedback()` (high/medium/low + comment) — that's the only feedback path, since the portals have no rating UI.
+- `prompts/system-prompt.md` — the memory instructions appended to the system prompt. Edit freely. Includes the recall-feedback contract: after every `recall_memory` call the agent must submit a quality rating via `submit_recall_session_feedback` (high/medium/low + comment) — that's the only feedback path, since the portals have no rating UI.
 - `prompts/queries.md` — recall queries, one per line. `#` comments and blank lines ignored. Queries are repo-scoped at runtime (`[repo-name] query`).
 
 Overwrite per-user via `systemPromptFile` / `queriesFile` in the config — no need to fork the package.
 
 ### Repo awareness (non-editable)
 
-When a session runs inside a git repo, the hook detects the repo name and appends a generated, **non-editable** block to the system prompt (`## Current Repository`) instructing the agent to include the repo name in `remember()` calls and prefix `recall_memory()` queries with it. Recall at session start is likewise scoped (`[repo-name] query`). This block is code-generated on purpose so it can't be accidentally edited away — it's what keeps memories from different repos from bleeding together.
+When a session runs inside a git repo, the hook detects the repo name and appends a generated, **non-editable** block to the system prompt (`## Current Repository`) instructing the agent to include the repo name in `remember` calls and prefix `recall_memory` queries with it. Recall at session start is likewise scoped (`[repo-name] query`). This block is code-generated on purpose so it can't be accidentally edited away — it's what keeps memories from different repos from bleeding together.
 
-### Self-contained tools (no mcp.json needed)
+### Span normalization
 
-At session start the plugin discovers the server's tools (`tools/list`) and registers them as regular pi tools — no `mcp.json` entry required. This is the fully self-contained path for a user who only runs dense-mem via this plugin:
-
-```json
-{ "server": { "url": "http://your-server:8080/mcp", "token": "dm_<profile-token>" } }
-```
-
-**To avoid double-registration, the plugin skips injection when `mcp.json` contains a `dense-mem` server entry** — pi's own MCP client owns the tools there. Remove that entry to let the plugin own them:
-
-```bash
-# keep tools from the plugin instead of pi's MCP client
-# (edit ~/.pi/agent/mcp.json and delete the dense-mem block)
-```
-
-Trade-off: pi's MCP client has a richer result surface (streaming, structured details); the plugin's injected tools proxy `tools/call` and return text content — identical for dense-mem's JSON-text results, and it uses the same `timeoutMs`. Discovery happens per session start; a dead server just means no tools (and no hang).
+When the LLM calls `remember` or `correct_relationship`, the `tool_call` hook automatically repairs hand-counted span offsets before submission. The server requires each surface (subject name, predicate surface, object name) to be an exact Unicode code-point slice of the evidence content — LLMs get this wrong ~4 attempts out of 5. The hook recomputes spans from verbatim surfaces (code-point aware via `Array.from`, correct for emoji/CJK) and clamps out-of-bounds supports. This runs transparently — the agent never sees the correction.
 
 ## Development
 

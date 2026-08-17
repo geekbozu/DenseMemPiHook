@@ -1,7 +1,7 @@
 {
   "name": "dense-mem-hooks",
-  "version": "0.2.2",
-  "description": "Pi extension: injects Dense-Mem context from previous sessions at session start and adds memory usage instructions to the system prompt.",
+  "version": "0.3.0",
+  "description": "Pi extension: lifecycle hooks for Dense-Mem — automatic session recall, memory instructions, and span normalization. Dense-mem tools come from pi-mcp-adapter via mcp.json.",
   "keywords": ["pi-package", "dense-mem", "memory"],
   "license": "MIT",
   "type": "module",
@@ -9,8 +9,7 @@
     "test": "node --test --import ./test/stub-pi.mjs test/config.test.mjs test/tools.test.mjs"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
     "extensions": ["./extensions"]

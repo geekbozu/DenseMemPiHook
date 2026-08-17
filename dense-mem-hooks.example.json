@@ -1,6 +1,7 @@
 {
-  // REQUIRED: the dense-mem server connection. Omit this block entirely
-  // and the hook falls back to the "dense-mem" entry in ~/.pi/agent/mcp.json.
+  // Server override — omit this block to use the "dense-mem" entry from
+  // ~/.pi/agent/mcp.json (recommended: tools come from pi-mcp-adapter).
+  // Only needed when this hook must override the mcp.json connection.
   "server": {
     "url": "https://mem.example.com/mcp",
     "token": "dm_your-profile-token-here"

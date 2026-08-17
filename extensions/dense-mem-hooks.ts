@@ -4,7 +4,6 @@ import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 
 // This extension's own directory (resolves correctly under jiti) — prompts/ ships next to extensions/.
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -143,8 +142,8 @@ export function isDuplicate(c: string, seen: Set<string>): boolean {
 // Non-editable repo block: generated from git detection, appended after the editable prompt file.
 const REPO_PROMPT = (repo: string) =>
   `## Current Repository\n\nRepository: ${repo}\n\n` +
-  `When calling remember(), include the repository name so memories are scoped to this repo. ` +
-  `When calling recall_memory(), prefix queries with the repository name.\n`;
+  `When calling remember, include the repository name so memories are scoped to this repo. ` +
+  `When calling recall_memory, prefix queries with the repository name.\n`;
 
 /** Build the system prompt appendix: editable prompt file (if any) + non-editable repo block (if repo detected). */
 export function buildSystemPrompt(base: string, cfg: HookConfig, repo?: string): string | undefined {
@@ -173,61 +172,24 @@ function detectRepoCached(cwd: string): string | undefined {
   return cachedRepo;
 }
 
-async function rpc(server: { url: string; token: string }, timeoutMs: number, method: string, params: unknown, externalSignal?: AbortSignal): Promise<any> {
-  const timeoutSignal = AbortSignal.timeout(timeoutMs); // never hang session_start on a dead server
-  const signal =
-    externalSignal && typeof AbortSignal.any === "function"
-      ? AbortSignal.any([externalSignal, timeoutSignal])
-      : timeoutSignal;
+// Direct JSON-RPC to the dense-mem server for recall queries at session start.
+// The MCP adapter owns tool registration; this is only for the automatic context injection.
+async function recall(server: { url: string; token: string }, timeoutMs: number, query: string, limit = 10): Promise<Array<{ context?: string; content?: string }>> {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const resp = await fetch(server.url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${server.token}` },
-    signal,
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    signal: timeoutSignal,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "recall_memory", arguments: { query, limit } },
+    }),
   });
-  return resp.json();
-}
-
-async function dmCall(server: { url: string; token: string }, timeoutMs: number, method: string, args: Record<string, unknown>): Promise<string> {
-  const data = await rpc(server, timeoutMs, "tools/call", { name: method, arguments: args });
-  return data?.result?.content?.[0]?.text ?? "{}";
-}
-
-async function recall(server: { url: string; token: string }, timeoutMs: number, query: string, limit = 10) {
-  const text = await dmCall(server, timeoutMs, "recall_memory", { query, limit });
+  const data = await resp.json();
+  const text = data?.result?.content?.[0]?.text ?? "{}";
   return JSON.parse(text)?.results ?? [];
-}
-
-/** Parse an MCP tools/list result into registerable tool defs. */
-export function parseToolDefs(listResult: any): Array<{ name: string; description: string; schema: Record<string, unknown> }> {
-  const tools = listResult?.result?.tools ?? [];
-  return tools
-    .filter((t: any) => t?.name && typeof t.name === "string")
-    .map((t: any) => ({
-      name: t.name,
-      description: (t.description ?? "").slice(0, 500),
-      schema: (t.inputSchema ?? { type: "object" }) as Record<string, unknown>,
-    }));
-}
-
-/** Map an MCP tools/call response envelope to a pi tool result. JSON-RPC errors become real tool errors, not "(empty result)". */
-export function mapMcpResult(res: any) {
-  if (res?.error) {
-    return {
-      content: [{ type: "text" as const, text: `dense-mem error ${res.error.code}: ${res.error.message}` }],
-      details: {},
-      isError: true,
-    };
-  }
-  const text = (res?.result?.content ?? [])
-    .filter((c: any) => c?.type === "text")
-    .map((c: any) => c.text)
-    .join("\n");
-  return {
-    content: [{ type: "text" as const, text: text || "(empty result)" }],
-    details: {},
-    isError: res?.result?.isError === true,
-  };
 }
 
 /** Anchor stored evidence to this repo: prefix content with [repo] (session_start recall
@@ -273,7 +235,17 @@ export function normalizeSpans(evidence: unknown[], relationships: unknown[]): u
     if (!cps) return;
     if (cps.slice(span.start ?? -1, span.end ?? -1).join("") === surface) return; // already exact
     const needle = Array.from(surface);
-    const at = cps.findIndex((_, i) => needle.every((ch, j) => cps[i + j] === ch));
+    // The model's hand-count is close but not exact, so snap to the occurrence
+    // NEAREST its original start: a span aimed at the 2nd "foo" must not silently
+    // move to the 1st. Tie (equal distance) → lower index, deterministic.
+    const orig = span.start ?? 0;
+    let at = -1;
+    let dist = Infinity;
+    for (let i = 0; i + needle.length <= cps.length; i++) {
+      if (!needle.every((ch, j) => cps[i + j] === ch)) continue;
+      const d = Math.abs(i - orig);
+      if (d < dist) { dist = d; at = i; }
+    }
     if (at < 0) return; // not verbatim — leave for the server to report
     span.start = at;
     span.end = at + needle.length;
@@ -319,58 +291,76 @@ export function requestIdempotencyKey(args: Record<string, unknown>): string | u
   return `sha256:${sum}`;
 }
 
-// True when the user manages dense-mem via mcp.json — pi's own MCP client already
-// exposes the tools there, so the plugin must not double-register them.
-function mcpManagesDenseMem(): boolean {
-  try {
-    const mcp = JSON.parse(readFileSync(join(getAgentDir(), "mcp.json"), "utf-8"));
-    return Boolean(mcp.mcpServers?.["dense-mem"]);
-  } catch {
-    return false;
-  }
-}
+// Known dense-mem tool name stems. Matched suffix-style to handle server prefixes like "dense-mem_".
+const DENSE_MEM_TOOL_STEMS = [
+  "remember",
+  "recall_memory",
+  "correct_relationship",
+  "retract_evidence",
+  "submit_recall_session_feedback",
+];
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async (_event, ctx) => {
-    const cfg = resolveConfig(ctx.cwd);
+  // Module-level flag: set once per session in session_start, read by all handlers.
+  // true = MCP adapter has registered dense-mem tools; false = skip everything.
+  let toolsAvailable = false;
 
-    // Self-contained tool injection: discover the server's tools and register them,
-    // unless mcp.json already manages the dense-mem server (no duplicates).
-    if (cfg.server?.url && cfg.server?.token && !mcpManagesDenseMem()) {
-      try {
-        const list = await rpc(cfg.server, cfg.timeoutMs!, "tools/list", {});
-        const repo = cfg.repoName ?? detectRepoCached(ctx.cwd); // anchor writes, not just recall queries
-        for (const def of parseToolDefs(list)) {
-          const snippet = def.description.split("\n")[0].slice(0, 120);
-          pi.registerTool({
-            name: def.name,
-            label: def.name,
-            description: def.description || "(no description)",
-            promptSnippet: snippet || def.name,
-            parameters:
-              typeof (Type as any).Unsafe === "function"
-                ? (Type as any).Unsafe(def.schema)
-                : def.schema,
-            async execute(_toolCallId, params, signal) {
-              let args = (params ?? {}) as Record<string, unknown>;
-              if (def.name.endsWith("remember")) {
-                args = scopeEvidence(args, repo); // [repo] prefix + label
-                normalizeSpans(args.evidence as unknown[], args.relationships as unknown[]); // span shift from the prefix is repaired here too
-                args.idempotency_key ??= requestIdempotencyKey(args); // identical requests replay server-side instead of double-ingesting
-              }
-              const res = await rpc(cfg.server, cfg.timeoutMs!, "tools/call", {
-                name: def.name,
-                arguments: args,
-              }, signal);
-              return mapMcpResult(res); // full envelope: errors at res.error must surface, not vanish
-            },
-          });
-        }
-      } catch {
-        // server unreachable — tools skipped; context recall below still runs
+  // ── tool_call hook: normalize spans + scope evidence for remember/correct_relationship ──
+  // Already implicitly gated: only fires when the LLM calls the tool.
+  pi.on("tool_call", async (event) => {
+    const isRemember = event.toolName === "remember" || event.toolName.endsWith("_remember");
+    const isCorrect = event.toolName === "correct_relationship" || event.toolName.endsWith("_correct_relationship");
+    if (!isRemember && !isCorrect) return;
+    const args = event.input as Record<string, unknown> | undefined;
+    if (!args) return;
+
+    // Scope evidence: [repo] prefix + repo label (remember only — correct_relationship replaces existing)
+    if (isRemember) {
+      const cfg = resolveConfig(event.cwd ?? process.cwd());
+      const repo = cfg.repoName ?? detectRepoCached(event.cwd ?? process.cwd());
+      Object.assign(event.input, scopeEvidence(args, repo));
+      // Stable idempotency key: identical requests replay server-side instead of double-ingesting
+      if (typeof (event.input as Record<string, unknown>).idempotency_key === "undefined") {
+        (event.input as Record<string, unknown>).idempotency_key = requestIdempotencyKey(event.input as Record<string, unknown>);
       }
     }
 
+    // Normalize spans: repair LLM hand-counted offsets (code-point aware, handles emoji/CJK)
+    normalizeSpans(
+      (event.input as Record<string, unknown>).evidence as unknown[],
+      (event.input as Record<string, unknown>).relationships as unknown[],
+    );
+  });
+
+  // ── session_start: detect MCP tools + inject recall context ──
+  pi.on("session_start", async (_event, ctx) => {
+    // Check that the MCP adapter has registered dense-mem tools.
+    // Everything is gated on this: no tools = no recall, no instructions.
+    // Retry a few times — MCP lazy/connecting servers may not be ready yet.
+    const hasTools = () => {
+      const allTools = pi.getAllTools();
+      return DENSE_MEM_TOOL_STEMS.some((stem) =>
+        allTools.some((t) => t.name === stem || t.name.endsWith(`_${stem}`)),
+      );
+    };
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (hasTools()) break;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
+    toolsAvailable = hasTools();
+
+    if (!toolsAvailable) {
+      ctx.ui.notify(
+        "Dense-mem tools not found in MCP. " +
+        "Add dense-mem to ~/.pi/agent/mcp.json and /reload, " +
+        "or install pi-mcp-adapter if not already installed.",
+        "warning",
+      );
+      return; // no tools → no recall, no instructions
+    }
+
+    const cfg = resolveConfig(ctx.cwd);
     if (!cfg.server?.url || !cfg.server?.token) return;
 
     const queries = readQueries(cfg.queriesFile);
@@ -411,7 +401,11 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // ── before_agent_start: inject memory instructions into system prompt ──
+  // Gated on toolsAvailable (set in session_start). Don't tell the agent
+  // about tools that don't exist.
   pi.on("before_agent_start", async (event, ctx) => {
+    if (!toolsAvailable) return;
     const cfg = resolveConfig(ctx.cwd);
     const built = buildSystemPrompt(event.systemPrompt, cfg, cfg.repoName ?? detectRepoCached(ctx.cwd));
     if (!built) return;
