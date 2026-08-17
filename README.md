@@ -98,19 +98,17 @@ Add a `denseMem` key to your pi settings file:
 
 Project settings (`.pi/settings.json`) override global (`~/.pi/settings.json`) per-field, same merge semantics as pi itself. Server fields merge layer-by-layer so a project can override just the token.
 
-### Token file & environment variable
+### Token file
 
-Place a `.dense-mem-token` file in your repo root (or `~/.pi/agent/` as fallback) containing the raw token. Easy to gitignore, doesn't need to be shared with config:
+Place a `.dense-mem-token` file in your repo root (or `~/.pi/agent/` as fallback) containing the raw token. The extension reads it at load time and injects it into `process.env` before the MCP adapter connects, so `bearerTokenEnv` picks it up automatically:
 
 ```
 # .dense-mem-token (repo root, gitignore this)
 dm_your-profile-token-here
 ```
 
-The extension reads `.dense-mem-token` automatically. For the MCP adapter, set `DENSE_MEM_TOKEN` in your environment and reference it in `mcp.json`:
-
 ```json
-// mcp.json
+// mcp.json — no token here, just the env var reference
 {
   "mcpServers": {
     "dense-mem": {
@@ -120,14 +118,7 @@ The extension reads `.dense-mem-token` automatically. For the MCP adapter, set `
 }
 ```
 
-Load the env var from `.dense-mem-token` in your shell profile:
-
-```bash
-# ~/.bashrc, ~/.zshrc, etc.
-export DENSE_MEM_TOKEN=$(cat ~/.pi/agent/.dense-mem-token)
-```
-
-Or configure your IDE/terminal to source a `.env` file on startup.
+One file, no env setup. Repo root wins over `~/.pi/agent/`.
 
 - **`server`** — overrides the dense-mem connection. If absent, the hook reads the `dense-mem` entry from `~/.pi/agent/mcp.json`.
 - **`repoName`** — replaces the git-root basename used for memory scoping (`[repo] ` query prefix and the `Repository:` system-prompt block). Set it when the repo's directory name is generic or noisy (e.g. a monorepo checked out as `web`). Repo config only — a global name for every repo makes no sense, so it's ignored there.

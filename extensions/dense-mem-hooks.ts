@@ -340,6 +340,17 @@ const DENSE_MEM_TOOL_STEMS = [
 ];
 
 export default function (pi: ExtensionAPI) {
+  // Inject token from .dense-mem-token into process.env at load time,
+  // before the MCP adapter connects. This lets bearerTokenEnv read it
+  // without the token living in mcp.json.
+  const tokenPath = [
+    join(process.cwd(), ".dense-mem-token"),
+    join(getAgentDir(), ".dense-mem-token"),
+  ].find((p) => { try { return existsSync(p); } catch { return false; } });
+  if (tokenPath && !process.env.DENSE_MEM_TOKEN) {
+    try { process.env.DENSE_MEM_TOKEN = readFileSync(tokenPath, "utf-8").trim(); } catch {}
+  }
+
   // Module-level flag: set once per session in session_start, read by all handlers.
   // true = MCP adapter has registered dense-mem tools; false = skip everything.
   let toolsAvailable = false;
