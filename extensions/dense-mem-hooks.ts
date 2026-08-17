@@ -125,7 +125,7 @@ export function resolveConfig(cwd: string): HookConfig {
     const dm = mcp?.mcpServers?.["dense-mem"];
     cfg.server = {
       url: cfg.server?.url ?? dm?.url,
-      token: cfg.server?.token ?? fileToken ?? dm?.bearerToken,
+      token: cfg.server?.token ?? fileToken ?? process.env.DENSE_MEM_TOKEN ?? dm?.bearerToken,
     };
   }
   return cfg;

@@ -98,7 +98,7 @@ Add a `denseMem` key to your pi settings file:
 
 Project settings (`.pi/settings.json`) override global (`~/.pi/settings.json`) per-field, same merge semantics as pi itself. Server fields merge layer-by-layer so a project can override just the token.
 
-### Token file
+### Token file & environment variable
 
 Place a `.dense-mem-token` file in your repo root (or `~/.pi/agent/` as fallback) containing the raw token. Easy to gitignore, doesn't need to be shared with config:
 
@@ -107,28 +107,27 @@ Place a `.dense-mem-token` file in your repo root (or `~/.pi/agent/` as fallback
 dm_your-profile-token-here
 ```
 
-Settings always win over the token file.
+The extension reads `.dense-mem-token` automatically. For the MCP adapter, set `DENSE_MEM_TOKEN` in your environment and reference it in `mcp.json`:
 
-### Connecting mcp.json to the token file
-
-The MCP adapter needs the bearer token in `mcp.json`. Use `bearerToken` with a `!` command prefix to read from `.dense-mem-token` at connect time instead of hardcoding the token:
-
-**Linux / macOS (bash):**
 ```json
-"bearerToken": "!cat .dense-mem-token 2>/dev/null || cat ~/.pi/agent/.dense-mem-token"
+// mcp.json
+{
+  "mcpServers": {
+    "dense-mem": {
+      "bearerTokenEnv": "DENSE_MEM_TOKEN"
+    }
+  }
+}
 ```
 
-**Windows (Git Bash / WSL):**
-```json
-"bearerToken": "!cat .dense-mem-token 2>/dev/null || cat ~/.pi/agent/.dense-mem-token"
+Load the env var from `.dense-mem-token` in your shell profile:
+
+```bash
+# ~/.bashrc, ~/.zshrc, etc.
+export DENSE_MEM_TOKEN=$(cat ~/.pi/agent/.dense-mem-token)
 ```
 
-**Windows (cmd.exe):**
-```json
-"bearerToken": "!node -e \"const f=require('fs'),h=require('os').homedir();try{process.stdout.write(f.readFileSync('.dense-mem-token','utf8').trim())}catch{process.stdout.write(f.readFileSync(h+'/.pi/agent/.dense-mem-token','utf8').trim())}\""
-```
-
-The `!` prefix runs a shell command and uses the output as the token. Each checks the repo root first, then falls back to `~/.pi/agent/.dense-mem-token`. Restart pi or `/reload` after changing `mcp.json`.
+Or configure your IDE/terminal to source a `.env` file on startup.
 
 - **`server`** — overrides the dense-mem connection. If absent, the hook reads the `dense-mem` entry from `~/.pi/agent/mcp.json`.
 - **`repoName`** — replaces the git-root basename used for memory scoping (`[repo] ` query prefix and the `Repository:` system-prompt block). Set it when the repo's directory name is generic or noisy (e.g. a monorepo checked out as `web`). Repo config only — a global name for every repo makes no sense, so it's ignored there.
