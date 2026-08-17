@@ -109,6 +109,27 @@ dm_your-profile-token-here
 
 Settings always win over the token file.
 
+### Connecting mcp.json to the token file
+
+The MCP adapter needs the bearer token in `mcp.json`. Use `bearerToken` with a `!` command prefix to read from `.dense-mem-token` at connect time instead of hardcoding the token:
+
+**Linux / macOS (bash):**
+```json
+"bearerToken": "!cat .dense-mem-token 2>/dev/null || cat ~/.pi/agent/.dense-mem-token"
+```
+
+**Windows (Git Bash / WSL):**
+```json
+"bearerToken": "!cat .dense-mem-token 2>/dev/null || cat ~/.pi/agent/.dense-mem-token"
+```
+
+**Windows (cmd.exe):**
+```json
+"bearerToken": "!node -e \"const f=require('fs'),h=require('os').homedir();try{process.stdout.write(f.readFileSync('.dense-mem-token','utf8').trim())}catch{process.stdout.write(f.readFileSync(h+'/.pi/agent/.dense-mem-token','utf8').trim())}\""
+```
+
+The `!` prefix runs a shell command and uses the output as the token. Each checks the repo root first, then falls back to `~/.pi/agent/.dense-mem-token`. Restart pi or `/reload` after changing `mcp.json`.
+
 - **`server`** — overrides the dense-mem connection. If absent, the hook reads the `dense-mem` entry from `~/.pi/agent/mcp.json`.
 - **`repoName`** — replaces the git-root basename used for memory scoping (`[repo] ` query prefix and the `Repository:` system-prompt block). Set it when the repo's directory name is generic or noisy (e.g. a monorepo checked out as `web`). Repo config only — a global name for every repo makes no sense, so it's ignored there.
 - **`timeoutMs`** — per-recall timeout (default `30000`; 30s because recall can exceed 5s on a slow assessor). The hook never hangs `session_start` when the server is down — it gives up and lets the agent recall via tools.
