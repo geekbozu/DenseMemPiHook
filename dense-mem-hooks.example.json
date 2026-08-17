@@ -12,6 +12,15 @@
   // "timeoutMs": 30000,         // per-recall timeout in ms; session_start never hangs past this (30s: recall can exceed 5s)
   // "maxContextChars": 12000,   // total char budget for injected snippets (~4 chars/token)
   // "recallLimit": 10,          // per-query recall size before dedupe (server default is 10)
-  // "systemPromptFile": "prompts/my-system-prompt.md", // relative to THIS config file's directory
+  // "systemPromptFile": "prompts/my-system-prompt.md", // relative to the config file's directory
   // "queriesFile": "prompts/my-queries.md"
 }
+
+// ── Config sources (priority highest → lowest, per-field) ──
+//
+// 1. Project settings: .pi/settings.json { denseMem: { ... } }
+// 2. Global settings:  ~/.pi/settings.json { denseMem: { ... } }
+// 3. Token file:       .dense-mem-token in repo root or ~/.pi/agent/
+// 4. MCP fallback:     mcp.json dense-mem entry (url + bearerToken only)
+//
+// Token file is a raw token, easy to gitignore separate from config.

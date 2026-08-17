@@ -29,8 +29,10 @@ function agentDirWith({ config, mcpJson } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "dmhook-tools-"));
   process.env.__TEST_AGENT_DIR__ = dir;
   if (config) {
-    mkdirSync(join(dir, "extensions"), { recursive: true });
-    writeFileSync(join(dir, "extensions", "dense-mem-hooks.json"), JSON.stringify(config));
+    // Write denseMem config to pi's settings.json (one level up from agent dir)
+    const settingsDir = join(dir, "..");
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(settingsDir, "settings.json"), JSON.stringify({ denseMem: config }));
   }
   if (mcpJson) writeFileSync(join(dir, "mcp.json"), JSON.stringify(mcpJson));
   return dir;

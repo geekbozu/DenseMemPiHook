@@ -8,11 +8,6 @@ import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works
 // This extension's own directory (resolves correctly under jiti) — prompts/ ships next to extensions/.
 const EXT_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Config layers, highest priority last: repo (.pi/dense-mem-hooks.json) > global (~/.pi/agent/extensions/) > mcp.json (server only).
-// Both paths are resolved lazily so getAgentDir() is read at use time.
-const GLOBAL_CONFIG_PATH = () => join(getAgentDir(), "extensions", "dense-mem-hooks.json");
-const REPO_CONFIG_PATH = (cwd: string) => join(cwd, CONFIG_DIR_NAME, "dense-mem-hooks.json");
-
 export interface HookConfig {
   server?: { url?: string; token?: string };
   repoName?: string; // override the detected repo name used for memory scoping
@@ -22,6 +17,8 @@ export interface HookConfig {
   systemPromptFile?: string;
   queriesFile?: string;
 }
+
+
 
 const DEFAULTS = { timeoutMs: 30000, maxContextChars: 4096, recallLimit: 10 }; // recallLimit = server's own DefaultLimit; ~4 chars/token
 
@@ -62,31 +59,73 @@ function readJson(p: string): HookConfig | undefined {
   }
 }
 
-// Resolve a layer's relative prompt paths against the directory of the file they came from.
-function absolutize(cfg: HookConfig, baseDir: string): HookConfig {
-  const abs = (p?: string) => (p ? (isAbsolute(p) ? p : resolve(baseDir, p)) : undefined);
-  return { ...cfg, systemPromptFile: abs(cfg.systemPromptFile), queriesFile: abs(cfg.queriesFile) };
+
+
+/** Read a token from a file, trimming whitespace. Returns undefined if missing or empty. */
+function readTokenFile(filePath: string): string | undefined {
+  try {
+    const raw = readFileSync(filePath, "utf-8").trim();
+    return raw || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-/** Resolve effective config for a cwd: repo overrides global, server fields merge per-layer, mcp.json fills gaps. */
+/** Find a token file in repo root or agent dir. */
+function findTokenFile(cwd: string): string | undefined {
+  const candidates = [
+    join(cwd, ".dense-mem-token"),              // repo root
+    join(getAgentDir(), ".dense-mem-token"),     // agent dir fallback
+  ];
+  for (const p of candidates) {
+    const token = readTokenFile(p);
+    if (token) return token;
+  }
+  return undefined;
+}
+
+/** Read a pi settings.json and return the denseMem key if present.
+ *  Relative prompt paths are absolutized against the settings file's directory.
+ */
+function readSettings(cwd: string): Partial<HookConfig> {
+  const read = (p: string): Partial<HookConfig> => {
+    try {
+      const raw = (JSON.parse(readFileSync(p, "utf-8")) as Record<string, unknown>).denseMem as Partial<HookConfig> ?? {};
+      const base = dirname(p);
+      const abs = (fp?: string) => (fp ? (isAbsolute(fp) ? fp : resolve(base, fp)) : undefined);
+      return { ...raw, systemPromptFile: abs(raw.systemPromptFile), queriesFile: abs(raw.queriesFile) };
+    } catch {
+      return {};
+    }
+  };
+  const global = read(join(getAgentDir(), "..", "settings.json"));
+  const project = read(join(cwd, CONFIG_DIR_NAME, "settings.json"));
+  return { ...global, ...project, server: { ...global.server, ...project.server } };
+}
+
+/** Resolve effective config for a cwd.
+ * 
+ * Priority chain (highest wins per field):
+ * 1. Project settings: .pi/settings.json { denseMem: { ... } }
+ * 2. Global settings: ~/.pi/settings.json { denseMem: { ... } }
+ * 3. Token file: .dense-mem-token in repo root or agent dir
+ * 4. MCP fallback: mcp.json dense-mem entry (server only)
+ */
 export function resolveConfig(cwd: string): HookConfig {
-  const global = absolutize(readJson(GLOBAL_CONFIG_PATH()) ?? {}, dirname(GLOBAL_CONFIG_PATH()));
-  const repo = absolutize(readJson(REPO_CONFIG_PATH(cwd)) ?? {}, join(cwd, CONFIG_DIR_NAME));
+  const settings = readSettings(cwd);
+  const fileToken = findTokenFile(cwd);
   const cfg: HookConfig = {
-    ...global,
-    ...repo,
-    server: { ...global.server, ...repo.server },
-    repoName: repo.repoName, // repo-scoped only: a global name for every repo makes no sense
-    timeoutMs: repo.timeoutMs ?? global.timeoutMs ?? DEFAULTS.timeoutMs,
-    maxContextChars: repo.maxContextChars ?? global.maxContextChars ?? DEFAULTS.maxContextChars,
-    recallLimit: repo.recallLimit ?? global.recallLimit ?? DEFAULTS.recallLimit,
+    ...settings,
+    timeoutMs: settings.timeoutMs ?? DEFAULTS.timeoutMs,
+    maxContextChars: settings.maxContextChars ?? DEFAULTS.maxContextChars,
+    recallLimit: settings.recallLimit ?? DEFAULTS.recallLimit,
   };
   if (!cfg.server?.url || !cfg.server?.token) {
     const mcp = readJson(join(getAgentDir(), "mcp.json")) as HookConfig & { mcpServers?: Record<string, { url?: string; bearerToken?: string }> };
     const dm = mcp?.mcpServers?.["dense-mem"];
     cfg.server = {
       url: cfg.server?.url ?? dm?.url,
-      token: cfg.server?.token ?? dm?.bearerToken,
+      token: cfg.server?.token ?? fileToken ?? dm?.bearerToken,
     };
   }
   return cfg;

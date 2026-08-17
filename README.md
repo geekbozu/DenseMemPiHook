@@ -68,26 +68,46 @@ The extension will warn once at session start if it detects the server is config
 
 ## Config
 
-All fields are optional. The extension reads its own config for hook-specific settings (recall queries, system prompt, timeouts) from:
+All fields are optional. The extension reads config from pi's `settings.json` files, merged per-field (project overrides global):
 
-- **Global:** `~/.pi/agent/extensions/dense-mem-hooks.json`
-- **Repo:** `.pi/dense-mem-hooks.json` (overrides global per-field)
+| Priority | Source | Scope |
+|----------|--------|-------|
+| 1 (highest) | `.pi/settings.json` `{ denseMem: { ... } }` | Project |
+| 2 | `~/.pi/settings.json` `{ denseMem: { ... } }` | Global |
+| 3 | `.dense-mem-token` file | Repo root / agent dir |
+| 4 (lowest) | `mcp.json` `dense-mem` entry | Global (server only) |
 
-The MCP server connection comes from `mcp.json` (above). The hook config can optionally override it:
+### settings.json
+
+Add a `denseMem` key to your pi settings file:
 
 ```json
+// ~/.pi/settings.json (global) or .pi/settings.json (project)
 {
-  "server": { "url": "https://mem.example.com/mcp", "token": "dm_your-profile-token-here" },
-  "repoName": "my-repo",
-  "timeoutMs": 30000,
-  "maxContextChars": 12000,
-  "recallLimit": 10,
-  "systemPromptFile": "prompts/my-system-prompt.md",
-  "queriesFile": "prompts/my-queries.md"
+  "denseMem": {
+    "server": { "url": "https://mem.example.com/mcp", "token": "dm_your-profile-token-here" },
+    "repoName": "my-repo",
+    "timeoutMs": 30000,
+    "maxContextChars": 12000,
+    "recallLimit": 10,
+    "systemPromptFile": "prompts/my-system-prompt.md",
+    "queriesFile": "prompts/my-queries.md"
+  }
 }
 ```
 
-Copy the example to `~/.pi/agent/extensions/dense-mem-hooks.json` (or `<repo>/.pi/dense-mem-hooks.json` for a repo-scoped override) and edit. **JSONC is supported: `//` line and `/* */` block comments are stripped before parsing (string-aware, so URLs like `https://...` are safe).** Trailing commas are not supported. Relative `systemPromptFile`/`queriesFile` paths resolve against the config file's directory (`~/.pi/agent/extensions/` or `<repo>/.pi/` respectively).
+Project settings (`.pi/settings.json`) override global (`~/.pi/settings.json`) per-field, same merge semantics as pi itself. Server fields merge layer-by-layer so a project can override just the token.
+
+### Token file
+
+Place a `.dense-mem-token` file in your repo root (or `~/.pi/agent/` as fallback) containing the raw token. Easy to gitignore, doesn't need to be shared with config:
+
+```
+# .dense-mem-token (repo root, gitignore this)
+dm_your-profile-token-here
+```
+
+Settings always win over the token file.
 
 - **`server`** — overrides the dense-mem connection. If absent, the hook reads the `dense-mem` entry from `~/.pi/agent/mcp.json`.
 - **`repoName`** — replaces the git-root basename used for memory scoping (`[repo] ` query prefix and the `Repository:` system-prompt block). Set it when the repo's directory name is generic or noisy (e.g. a monorepo checked out as `web`). Repo config only — a global name for every repo makes no sense, so it's ignored there.
@@ -98,22 +118,22 @@ Copy the example to `~/.pi/agent/extensions/dense-mem-hooks.json` (or `<repo>/.p
 
 ## Repo-level overrides & teams
 
-Drop a `.pi/dense-mem-hooks.json` inside any repo to override the global config for that repo only. Fields merge per-layer (repo wins), and `server` merges field-by-field, so a repo can override just the token:
+Add a `.pi/settings.json` inside any repo to override the global config. Project settings override global per-field, and `server` merges field-by-field, so a project can override just the token:
 
-```jsonc
-// <repo>/.pi/dense-mem-hooks.json
+```json
+// <repo>/.pi/settings.json
 {
-  "server": { "token": "dm_other-team-profile-token" },
-  "queriesFile": "prompts/queries.md",
-  "systemPromptFile": "prompts/team-prompt.md"
+  "denseMem": {
+    "server": { "token": "dm_other-team-profile-token" },
+    "queriesFile": "prompts/queries.md",
+    "systemPromptFile": "prompts/team-prompt.md"
+  }
 }
 ```
 
-Effective resolution per field: repo `.pi/dense-mem-hooks.json` > global `~/.pi/agent/extensions/dense-mem-hooks.json` > `mcp.json` (server only). Relative prompt paths resolve against the config file they came from (`<repo>/.pi/` for repo configs), so prompt overrides can live inside the repo and be shared.
-
 **Teams:** Dense-Mem scopes memory to the team carried by the profile token. One team today = one global token. When you add teams, each repo gets its own token via `server.token` above — the same hook, no code changes. `server.url` only needs overriding when teams run on different servers.
 
-> **Secret hygiene:** `server.token` is a credential. If a repo config needs a token, gitignore it (`.pi/dense-mem-hooks.json` in that repo's `.gitignore`) or commit only prompt/query overrides and keep tokens in the global config.
+> **Secret hygiene:** `server.token` is a credential. Use `.dense-mem-token` in the repo root (gitignored) for per-repo tokens, or keep tokens in the global settings. Avoid committing tokens to version control.
 
 ## Known quirks
 
