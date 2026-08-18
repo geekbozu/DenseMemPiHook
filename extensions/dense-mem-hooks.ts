@@ -61,30 +61,8 @@ function readJson(p: string): HookConfig | undefined {
 
 
 
-/** Read a token from a file, trimming whitespace. Returns undefined if missing or empty. */
-function readTokenFile(filePath: string): string | undefined {
-  try {
-    const raw = readFileSync(filePath, "utf-8").trim();
-    return raw || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Find a token file in repo root or agent dir. */
-function findTokenFile(cwd: string): string | undefined {
-  const candidates = [
-    join(cwd, ".dense-mem-token"),              // repo root
-    join(getAgentDir(), ".dense-mem-token"),     // agent dir fallback
-  ];
-  for (const p of candidates) {
-    const token = readTokenFile(p);
-    if (token) return token;
-  }
-  return undefined;
-}
-
 /** Read a pi settings.json and return the denseMem key if present.
+ *  Behavior knobs only — server url/token live in mcp.json + DENSE_MEM_TOKEN.
  *  Relative prompt paths are absolutized against the settings file's directory.
  */
 function readSettings(cwd: string): Partial<HookConfig> {
@@ -100,35 +78,26 @@ function readSettings(cwd: string): Partial<HookConfig> {
   };
   const global = read(join(getAgentDir(), "..", "settings.json"));
   const project = read(join(cwd, CONFIG_DIR_NAME, "settings.json"));
-  return { ...global, ...project, server: { ...global.server, ...project.server } };
+  return { ...global, ...project };
 }
 
 /** Resolve effective config for a cwd.
- * 
- * Priority chain (highest wins per field):
- * 1. Project settings: .pi/settings.json { denseMem: { ... } }
- * 2. Global settings: ~/.pi/settings.json { denseMem: { ... } }
- * 3. Token file: .dense-mem-token in repo root or agent dir
- * 4. MCP fallback: mcp.json dense-mem entry (server only)
+ *
+ * Server config is not per-hook: the "dense-mem" entry in mcp.json is the single
+ * source for the URL, and the token is the DENSE_MEM_TOKEN env var — the same var
+ * the MCP adapter reads via bearerTokenEnv. Loading the token is the user's job
+ * (pi does not load .env files). settings.json holds behavior knobs only.
  */
 export function resolveConfig(cwd: string): HookConfig {
   const settings = readSettings(cwd);
-  const fileToken = findTokenFile(cwd);
-  const cfg: HookConfig = {
+  const mcp = readJson(join(getAgentDir(), "mcp.json")) as { mcpServers?: Record<string, { url?: string }> } | undefined;
+  return {
     ...settings,
+    server: { url: mcp?.mcpServers?.["dense-mem"]?.url, token: process.env.DENSE_MEM_TOKEN },
     timeoutMs: settings.timeoutMs ?? DEFAULTS.timeoutMs,
     maxContextChars: settings.maxContextChars ?? DEFAULTS.maxContextChars,
     recallLimit: settings.recallLimit ?? DEFAULTS.recallLimit,
   };
-  if (!cfg.server?.url || !cfg.server?.token) {
-    const mcp = readJson(join(getAgentDir(), "mcp.json")) as HookConfig & { mcpServers?: Record<string, { url?: string; bearerToken?: string }> };
-    const dm = mcp?.mcpServers?.["dense-mem"];
-    cfg.server = {
-      url: cfg.server?.url ?? dm?.url,
-      token: cfg.server?.token ?? fileToken ?? process.env.DENSE_MEM_TOKEN ?? dm?.bearerToken,
-    };
-  }
-  return cfg;
 }
 
 /** Read queries from a file (override or shipped prompts/queries.md). One per line, # comments and blanks ignored. */
@@ -340,16 +309,27 @@ const DENSE_MEM_TOOL_STEMS = [
 ];
 
 export default function (pi: ExtensionAPI) {
-  // Inject token from .dense-mem-token into process.env at load time,
-  // before the MCP adapter connects. This lets bearerTokenEnv read it
-  // without the token living in mcp.json.
-  const tokenPath = [
-    join(process.cwd(), ".dense-mem-token"),
-    join(getAgentDir(), ".dense-mem-token"),
-  ].find((p) => { try { return existsSync(p); } catch { return false; } });
-  if (tokenPath && !process.env.DENSE_MEM_TOKEN) {
-    try { process.env.DENSE_MEM_TOKEN = readFileSync(tokenPath, "utf-8").trim(); } catch {}
+  // Double-load guard: the installed package and a manually copied extension
+  // (e.g. ~/.pi/agent/extensions/) evaluate as different module URLs in the
+  // same process. The second copy registers nothing but a one-shot warning;
+  // /reload of the same file re-evaluates the same URL and stays active.
+  const LOADED_BY = "__denseMemHookLoadedBy";
+  const selfUrl = import.meta.url;
+  const loadedBy = (globalThis as Record<string, unknown>)[LOADED_BY];
+  if (loadedBy && loadedBy !== selfUrl) {
+    let warned = false;
+    pi.on("session_start", (_event, ctx) => {
+      if (warned) return;
+      warned = true;
+      ctx.ui.notify(
+        "DenseMemPiHook is loaded twice (installed package + a manual copy, e.g. in ~/.pi/agent/extensions/). " +
+        "Remove the manual copy — this duplicate is inactive.",
+        "warning",
+      );
+    });
+    return;
   }
+  (globalThis as Record<string, unknown>)[LOADED_BY] = selfUrl;
 
   // Module-level flag: set once per session in session_start, read by all handlers.
   // true = MCP adapter has registered dense-mem tools; false = skip everything.
@@ -411,7 +391,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     const cfg = resolveConfig(ctx.cwd);
-    if (!cfg.server?.url || !cfg.server?.token) return;
+    if (!cfg.server?.url) return;
+    if (!cfg.server.token) {
+      ctx.ui.notify(
+        "Dense-mem: DENSE_MEM_TOKEN env var not set — export it in your shell before starting pi (see README).",
+        "warning",
+      );
+      return;
+    }
 
     const queries = readQueries(cfg.queriesFile);
     if (queries.length === 0) return;

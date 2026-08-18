@@ -6,7 +6,7 @@ Pi extension that makes Dense-Mem memory automatic across sessions:
 - **`before_agent_start`** — appends memory instructions (from `prompts/system-prompt.md`) to the system prompt.
 - **`tool_call`** — normalizes span offsets in `remember`/`correct_relationship` calls so the server accepts them on the first try.
 
-The Dense-Mem MCP tools themselves (`remember`, `recall_memory`, etc.) come from [pi-mcp-adapter](https://github.com/earendil-works/pi-mcp-adapter) via your `mcp.json` config — this hook only adds the automatic context + instructions + span normalization on top.
+[Dense-Mem](https://github.com/markhuangai/dense-mem) is a self-hosted HTTP MCP memory server (Streamable HTTP, contract at `/mcp`; the browser routes are first-party interfaces, not an automation API). It stages exact evidence, derives semantic state through validated server policy, and returns active evidence contexts with graph-shaped Relationship handles. Its tools (`remember`, `recall_memory`, etc.) come from [pi-mcp-adapter](https://github.com/earendil-works/pi-mcp-adapter) via your `mcp.json` config — this hook only adds the automatic context + instructions + span normalization on top.
 
 ## What startup looks like
 
@@ -40,9 +40,9 @@ On a new session inside a git repo, two things happen before you type a word:
 
 ## Install
 
-### 1. Configure dense-mem in mcp.json
+### 1. Configure dense-mem in mcp.json — the only server config
 
-Add the dense-mem server to `~/.pi/agent/mcp.json` so pi-mcp-adapter exposes the tools:
+Add the dense-mem server to `~/.pi/agent/mcp.json` so pi-mcp-adapter exposes the tools *and* the hook knows where to recall from:
 
 ```json
 {
@@ -50,13 +50,37 @@ Add the dense-mem server to `~/.pi/agent/mcp.json` so pi-mcp-adapter exposes the
     "dense-mem": {
       "url": "https://mem.example.com/mcp",
       "auth": "bearer",
-      "bearerToken": "dm_your-profile-token-here"
+      "bearerTokenEnv": "DENSE_MEM_TOKEN"
     }
   }
 }
 ```
 
-### 2. Install this extension
+### 2. Export the token — one env var for both
+
+`DENSE_MEM_TOKEN` is read by the MCP adapter (`bearerTokenEnv` above) **and** by this hook's session-start recall. It is the API-key credential the server resolves to an immutable actor: team + identity + membership + permanent owner alias. Recall sees team-visible memory; you can only modify evidence and Relationships your own owner alias authored (correcting someone else's Relationship is rejected server-side). There is no project isolation inside a token — repos are kept separate *lexically* by the hook's `[repo]` scoping. For hard project isolation, use a separate credential/team per project and swap the env var.
+
+Pi does **not** load `.env` files — the var must be in the environment of the shell that launches pi. The easy way is the shipped bootstrap script: launch pi through it and your `.env` files are sourced for you:
+
+```bash
+./pi-dense-mem.sh            # sources ~/.pi/agent/.env then ./.env, then launches pi
+# or: alias pi='./pi-dense-mem.sh'
+```
+
+It sources, in order (later wins):
+
+1. `~/.pi/agent/.env` — your global **keyring**: one var per team credential. Working multiple teams? Keep all of them here (`DENSE_MEM_TOKEN`, `DENSE_MEM_ACME_TOKEN`, ...).
+2. `./.env` — repo-local overrides, e.g. a `DENSE_MEM_TEAM` selector when you run per-team MCP entries.
+
+Alternatively skip the script and export in your shell profile (`~/.zshrc`, `~/.bashrc`, direnv, or `setx` on Windows):
+
+```bash
+export DENSE_MEM_TOKEN=dm_your-profile-token-here
+```
+
+If it's missing, the hook warns once at session start and skips recall (the tools still work if the adapter has a token from elsewhere — but keep it in the one place: the env var).
+
+### 3. Install this extension
 
 ```bash
 pi install git:github.com/geekbozu/DenseMemPiHook
@@ -64,28 +88,26 @@ pi install git:github.com/geekbozu/DenseMemPiHook
 
 The extension will warn once at session start if it detects the server is configured but the MCP tools aren't available (e.g. pi-mcp-adapter not installed).
 
-> **Don't double-load:** if you previously copied the hook into `~/.pi/agent/extensions/`, remove that copy before installing the package, or the context injection and system prompt instructions run twice.
+> **Double-loading is now self-detected:** if the hook is loaded twice in one pi process (installed package *and* a manual copy, e.g. left in `~/.pi/agent/extensions/`), the second copy disables itself and warns once at session start — no double context injection, no double system-prompt blocks. Still remove the manual copy to clear the warning.
 
 ## Config
 
-All fields are optional. The extension reads config from pi's `settings.json` files, merged per-field (project overrides global):
+### Server + secret (one place, one var)
 
-| Priority | Source | Scope |
-|----------|--------|-------|
-| 1 (highest) | `.pi/settings.json` `{ denseMem: { ... } }` | Project |
-| 2 | `~/.pi/settings.json` `{ denseMem: { ... } }` | Global |
-| 3 | `.dense-mem-token` file | Repo root / agent dir |
-| 4 (lowest) | `mcp.json` `dense-mem` entry | Global (server only) |
+| What | Where |
+|------|-------|
+| URL | `mcp.json` → `mcpServers.dense-mem.url` |
+| Token | `DENSE_MEM_TOKEN` env var (referenced from mcp.json via `bearerTokenEnv`) — the credential; resolves team + owner alias |
 
-### settings.json
+That's it. No per-hook server overrides, no token files. Change the URL in mcp.json; change the credential to switch team/owner.
 
-Add a `denseMem` key to your pi settings file:
+### Behavior knobs (optional, pi settings)
+
+Add a `denseMem` key to your pi settings file — global `~/.pi/settings.json`, or project `.pi/settings.json` for per-repo overrides (merged per-field, project wins, same semantics as pi itself):
 
 ```json
-// ~/.pi/settings.json (global) or .pi/settings.json (project)
 {
   "denseMem": {
-    "server": { "url": "https://mem.example.com/mcp", "token": "dm_your-profile-token-here" },
     "repoName": "my-repo",
     "timeoutMs": 30000,
     "maxContextChars": 12000,
@@ -96,55 +118,11 @@ Add a `denseMem` key to your pi settings file:
 }
 ```
 
-Project settings (`.pi/settings.json`) override global (`~/.pi/settings.json`) per-field, same merge semantics as pi itself. Server fields merge layer-by-layer so a project can override just the token.
-
-### Token file
-
-Place a `.dense-mem-token` file in your repo root (or `~/.pi/agent/` as fallback) containing the raw token. The extension reads it at load time and injects it into `process.env` before the MCP adapter connects, so `bearerTokenEnv` picks it up automatically:
-
-```
-# .dense-mem-token (repo root, gitignore this)
-dm_your-profile-token-here
-```
-
-```json
-// mcp.json — no token here, just the env var reference
-{
-  "mcpServers": {
-    "dense-mem": {
-      "bearerTokenEnv": "DENSE_MEM_TOKEN"
-    }
-  }
-}
-```
-
-One file, no env setup. Repo root wins over `~/.pi/agent/`.
-
-- **`server`** — overrides the dense-mem connection. If absent, the hook reads the `dense-mem` entry from `~/.pi/agent/mcp.json`.
 - **`repoName`** — replaces the git-root basename used for memory scoping (`[repo] ` query prefix and the `Repository:` system-prompt block). Set it when the repo's directory name is generic or noisy (e.g. a monorepo checked out as `web`). Repo config only — a global name for every repo makes no sense, so it's ignored there.
 - **`timeoutMs`** — per-recall timeout (default `30000`; 30s because recall can exceed 5s on a slow assessor). The hook never hangs `session_start` when the server is down — it gives up and lets the agent recall via tools.
 - **`maxContextChars`** — total char budget for injected memory snippets (default `4096`, ≈1k tokens). A char budget instead of an entry count because snippet length varies wildly (~150–900 chars).
-- **`recallLimit`** — per-query recall size before dedupe (default `10`, the server's own default). Raise it if the injected context looks thin; `maxContextChars` still caps the total.
+- **`recallLimit`** — per-query recall size before dedupe (default `10`, within the server's 1–50 range). Raise it if the injected context looks thin; `maxContextChars` still caps the total.
 - **`systemPromptFile` / `queriesFile`** — override the shipped prompt files. Relative paths resolve against the config file's directory.
-
-## Repo-level overrides & teams
-
-Add a `.pi/settings.json` inside any repo to override the global config. Project settings override global per-field, and `server` merges field-by-field, so a project can override just the token:
-
-```json
-// <repo>/.pi/settings.json
-{
-  "denseMem": {
-    "server": { "token": "dm_other-team-profile-token" },
-    "queriesFile": "prompts/queries.md",
-    "systemPromptFile": "prompts/team-prompt.md"
-  }
-}
-```
-
-**Teams:** Dense-Mem scopes memory to the team carried by the profile token. One team today = one global token. When you add teams, each repo gets its own token via `server.token` above — the same hook, no code changes. `server.url` only needs overriding when teams run on different servers.
-
-> **Secret hygiene:** `server.token` is a credential. Use `.dense-mem-token` in the repo root (gitignored) for per-repo tokens, or keep tokens in the global settings. Avoid committing tokens to version control.
 
 ## Known quirks
 
@@ -163,7 +141,7 @@ If you rename the MCP server key (e.g. `"dense-mem"` → `"dm"`), the extension 
 
 The defaults ship as editable markdown in this repo:
 
-- `prompts/system-prompt.md` — the memory instructions appended to the system prompt. Edit freely. Includes the recall-feedback contract: after every `recall_memory` call the agent must submit a quality rating via `submit_recall_session_feedback` (high/medium/low + comment) — that's the only feedback path, since the portals have no rating UI.
+- `prompts/system-prompt.md` — the memory instructions appended to the system prompt. Edit freely. Includes the recall-feedback contract: after every `recall_memory` call the agent must submit a quality rating via `submit_recall_session_feedback` (quality `high`/`medium`/`low` + comment; the tool is registered only when the server has recall feedback enabled — `recall_memory` results point to it via `suggested_actions`). That's the only feedback path, since the portals have no rating UI.
 - `prompts/queries.md` — recall queries, one per line. `#` comments and blank lines ignored. Queries are repo-scoped at runtime (`[repo-name] query`).
 
 Overwrite per-user via `systemPromptFile` / `queriesFile` in the config — no need to fork the package.
@@ -175,6 +153,8 @@ When a session runs inside a git repo, the hook detects the repo name and append
 ### Span normalization
 
 When the LLM calls `remember` or `correct_relationship`, the `tool_call` hook automatically repairs hand-counted span offsets before submission. The server requires each surface (subject name, predicate surface, object name) to be an exact Unicode code-point slice of the evidence content — LLMs get this wrong ~4 attempts out of 5. The hook recomputes spans from verbatim surfaces (code-point aware via `Array.from`, correct for emoji/CJK) and clamps out-of-bounds supports. This runs transparently — the agent never sees the correction.
+
+**Version note:** this matches the current span-based `remember` schema (≤ v2.5.0). Since v2.5.1-rc.4, Dense-Mem drops `span`/`surface`/`supports` from `remember` entirely — Relationships reference `evidence_indices` and the assessor locates exact ranges server-side. Against such a server, legacy span fields are *rejected* by closed-schema validation, so this repair needs to become a strip (it only touches fields that no longer exist).
 
 ## Development
 

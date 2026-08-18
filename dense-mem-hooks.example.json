@@ -1,27 +1,39 @@
-{
-  // Server override — omit this block to use the "dense-mem" entry from
-  // ~/.pi/agent/mcp.json (recommended: tools come from pi-mcp-adapter).
-  // Only needed when this hook must override the mcp.json connection.
-  "server": {
-    "url": "https://mem.example.com/mcp",
-    "token": "dm_your-profile-token-here"
-  }
-
-  // Optional overrides — uncomment to use. Defaults are shown.
-  // "repoName": "my-repo",      // memory-scoping name when the git repo basename is generic/noisy
-  // "timeoutMs": 30000,         // per-recall timeout in ms
-  // "maxContextChars": 12000,   // total char budget for injected snippets (~4 chars/token)
-  // "recallLimit": 10,          // per-query recall size before dedupe
-  // "systemPromptFile": "prompts/my-system-prompt.md",
-  // "queriesFile": "prompts/my-queries.md"
-}
-
-// ── Config sources (priority highest → lowest, per-field) ──
+// ── DenseMemPiHook configuration reference (not a loaded file) ──
 //
-// 1. Project settings: .pi/settings.json { denseMem: { ... } }
-// 2. Global settings:  ~/.pi/settings.json { denseMem: { ... } }
-// 3. Token file:       .dense-mem-token in repo root or ~/.pi/agent/
-// 4. Env var:          process.env.DENSE_MEM_TOKEN
-// 5. MCP fallback:     mcp.json dense-mem entry (url + bearerToken)
-//
-// Token file is a raw token, easy to gitignore separate from config.
+// There is ONE server config (mcp.json) and ONE secret (the DENSE_MEM_TOKEN
+// env var). The token carries the memory pool (user + project isolation), so
+// per-repo server config is not a thing — swap the token to switch pools.
+// Note: pi does NOT load .env files; the token must be in the environment of
+// the shell that launches pi — use the shipped pi-dense-mem.sh bootstrap
+// (sources ~/.pi/agent/.env then ./.env) or export it in your shell profile.
+
+// 1. Server — the only place the URL lives: ~/.pi/agent/mcp.json
+// {
+//   "mcpServers": {
+//     "dense-mem": {
+//       "url": "https://mem.example.com/mcp",
+//       "auth": "bearer",
+//       "bearerTokenEnv": "DENSE_MEM_TOKEN"
+//     }
+//   }
+// }
+
+// 2. Secret — one env var for BOTH the MCP adapter (via bearerTokenEnv above)
+//    and this hook's session-start recall. Load it in your shell:
+//    export DENSE_MEM_TOKEN=dm_your-profile-token-here
+
+// 3. Behavior knobs — optional, in pi settings.json (global ~/.pi/settings.json
+//    or project .pi/settings.json, merged per-field, project wins):
+// {
+//   "denseMem": {
+//     "repoName": "my-repo",          // memory-scoping name when the git repo basename is generic/noisy
+//     "timeoutMs": 30000,             // per-recall timeout in ms
+//     "maxContextChars": 12000,       // total char budget for injected snippets (~4 chars/token)
+//     "recallLimit": 10,              // per-query recall size before dedupe
+//     "systemPromptFile": "prompts/my-system-prompt.md",
+//     "queriesFile": "prompts/my-queries.md"
+//   }
+// }
+
+// No active config — everything above is documentation.
+{}

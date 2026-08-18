@@ -19,11 +19,20 @@ function write(p, content) {
   writeFileSync(p, content);
 }
 
+// DENSE_MEM_TOKEN is the single token source; tests set/clear it explicitly.
+const setToken = (t) => (t === undefined ? delete process.env.DENSE_MEM_TOKEN : (process.env.DENSE_MEM_TOKEN = t));
+
+function writeMcp(agent, url) {
+  write(join(agent, "mcp.json"), JSON.stringify({ mcpServers: { "dense-mem": { url } } }));
+}
+
 test("no config anywhere -> empty server, defaults, shipped prompts", () => {
   const agent = makeAgentDir();
   const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
+  setToken(undefined);
   const cfg = resolveConfig(cwd);
   assert.equal(cfg.server?.url, undefined);
+  assert.equal(cfg.server?.token, undefined);
   assert.equal(cfg.timeoutMs, 30000);
   assert.equal(cfg.maxContextChars, 4096);
   assert.equal(cfg.recallLimit, 10);
@@ -37,7 +46,7 @@ test("no config anywhere -> empty server, defaults, shipped prompts", () => {
   rmSync(cwd, { recursive: true, force: true });
 });
 
-test("project settings.json overrides global settings.json", () => {
+test("project settings.json overrides global settings.json (behavior knobs only)", () => {
   const agent = makeAgentDir();
   const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
   // Global settings in a standalone dir to avoid leaking
@@ -46,41 +55,62 @@ test("project settings.json overrides global settings.json", () => {
   mkdirSync(join(globalDir, "agent"), { recursive: true });
   write(join(globalDir, "settings.json"), JSON.stringify({
     denseMem: {
-      server: { url: "http://global:1/mcp", token: "dm_global" },
       timeoutMs: 3000,
       maxContextChars: 2048,
       recallLimit: 20,
     },
   }));
+  writeMcp(join(globalDir, "agent"), "http://mcp:8080/mcp");
+  setToken("dm_env");
   write(join(cwd, ".pi", "settings.json"), JSON.stringify({
     denseMem: {
-      server: { token: "dm_project" }, // url inherited from global
       queriesFile: "queries-custom.md",
     },
   }));
   write(join(cwd, ".pi", "queries-custom.md"), "project query\n");
 
   const cfg = resolveConfig(cwd);
-  assert.equal(cfg.server.url, "http://global:1/mcp");
-  assert.equal(cfg.server.token, "dm_project");
+  // server comes from mcp.json + env var, not settings
+  assert.equal(cfg.server.url, "http://mcp:8080/mcp");
+  assert.equal(cfg.server.token, "dm_env");
   assert.equal(cfg.timeoutMs, 3000);
   assert.equal(cfg.maxContextChars, 2048);
   assert.equal(cfg.recallLimit, 20);
   assert.deepEqual(readQueries(cfg.queriesFile), ["project query"]);
+  setToken(undefined);
   rmSync(globalDir, { recursive: true, force: true });
   rmSync(cwd, { recursive: true, force: true });
 });
 
-test("mcp.json fills server gaps when no settings set server", () => {
+test("server config comes from mcp.json url + DENSE_MEM_TOKEN env var", () => {
   const agent = makeAgentDir();
-  write(join(agent, "mcp.json"), JSON.stringify({
-    mcpServers: { "dense-mem": { url: "http://mcp:8080/mcp", bearerToken: "dm_mcp" } },
-  }));
+  writeMcp(agent, "http://mcp:8080/mcp");
+  setToken("dm_env_token");
   const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
   const cfg = resolveConfig(cwd);
   assert.equal(cfg.server.url, "http://mcp:8080/mcp");
-  assert.equal(cfg.server.token, "dm_mcp");
+  assert.equal(cfg.server.token, "dm_env_token");
+  setToken(undefined);
   rmSync(agent, { recursive: true, force: true });
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+test("settings server key is ignored (mcp.json + env var are the only auth)", () => {
+  const agent = makeAgentDir();
+  const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
+  const globalDir = mkdtempSync(join(tmpdir(), "dmhook-global-"));
+  process.env.__TEST_AGENT_DIR__ = join(globalDir, "agent");
+  mkdirSync(join(globalDir, "agent"), { recursive: true });
+  write(join(globalDir, "settings.json"), JSON.stringify({
+    denseMem: { server: { url: "http://old:1/mcp", token: "dm_old" } },
+  }));
+  writeMcp(join(globalDir, "agent"), "http://mcp:8080/mcp");
+  setToken("dm_env");
+  const cfg = resolveConfig(cwd);
+  assert.equal(cfg.server.url, "http://mcp:8080/mcp", "mcp.json url wins");
+  assert.equal(cfg.server.token, "dm_env", "env token wins");
+  setToken(undefined);
+  rmSync(globalDir, { recursive: true, force: true });
   rmSync(cwd, { recursive: true, force: true });
 });
 
@@ -141,49 +171,15 @@ test("stripJsonComments: JSONC comments removed, URLs and escapes in strings kep
   assert.equal(parsed.esc, 'say "hi"');
 });
 
-test("shipped example config parses (JSONC) with core fields active, options documented", () => {
+test("shipped example config documents the single auth surface", () => {
   const example = join(dirname(fileURLToPath(import.meta.url)), "..", "dense-mem-hooks.example.json");
   const raw = readFileSync(example, "utf-8");
-  const cfg = JSON.parse(stripJsonComments(raw)); // strict JSON.parse after stripping — no comments allowed
-  assert.equal(cfg.server.url, "https://mem.example.com/mcp");
-  assert.equal(cfg.server.token, "dm_your-profile-token-here");
-  assert.deepEqual(Object.keys(cfg), ["server"], "only required fields active");
-  // optional knobs stay documented as comments so they don't silently drift
-  for (const key of ["timeoutMs", "maxContextChars", "recallLimit", "systemPromptFile", "queriesFile"]) {
+  const cfg = JSON.parse(stripJsonComments(raw));
+  assert.deepEqual(Object.keys(cfg), [], "no active config fields — reference card only");
+  for (const key of ["mcpServers", "bearerTokenEnv", "DENSE_MEM_TOKEN", "timeoutMs", "maxContextChars", "recallLimit", "systemPromptFile", "queriesFile"]) {
     assert.ok(raw.includes(key), `example documents ${key}`);
   }
-  // config source docs
-  assert.ok(raw.includes(".dense-mem-token"), "example documents token file");
-});
-
-test(".dense-mem-token file in repo root provides token fallback", () => {
-  const agent = makeAgentDir();
-  write(join(agent, "mcp.json"), JSON.stringify({
-    mcpServers: { "dense-mem": { url: "http://mcp:8080/mcp" } }, // no bearerToken
-  }));
-  const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
-  write(join(cwd, ".dense-mem-token"), "dm_file_token\n");
-  const cfg = resolveConfig(cwd);
-  assert.equal(cfg.server.url, "http://mcp:8080/mcp");
-  assert.equal(cfg.server.token, "dm_file_token");
-  rmSync(agent, { recursive: true, force: true });
-  rmSync(cwd, { recursive: true, force: true });
-})
-
-test("settings.json token beats file token", () => {
-  const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
-  // Isolated agent+settings dir
-  const globalDir = mkdtempSync(join(tmpdir(), "dmhook-global-"));
-  process.env.__TEST_AGENT_DIR__ = join(globalDir, "agent");
-  mkdirSync(join(globalDir, "agent"), { recursive: true });
-  write(join(globalDir, "settings.json"), JSON.stringify({
-    denseMem: { server: { url: "http://settings:8080/mcp", token: "dm_settings" } },
-  }));
-  write(join(cwd, ".dense-mem-token"), "dm_file_token\n");
-  const cfg = resolveConfig(cwd);
-  assert.equal(cfg.server.token, "dm_settings", "settings wins over file");
-  rmSync(globalDir, { recursive: true, force: true });
-  rmSync(cwd, { recursive: true, force: true });
+  assert.ok(raw.includes(".env"), "example explains pi does not load .env");
 });
 
 test("detectRepo returns the git root basename inside a repo", () => {

@@ -25,9 +25,11 @@ function makePi(overrides = {}) {
   return { pi, handlers, sent, notified, makeCtx };
 }
 
-function agentDirWith({ config, mcpJson } = {}) {
+function agentDirWith({ config, mcpJson, token } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "dmhook-tools-"));
   process.env.__TEST_AGENT_DIR__ = dir;
+  if (token !== undefined) process.env.DENSE_MEM_TOKEN = token;
+  else delete process.env.DENSE_MEM_TOKEN;
   if (config) {
     // Write denseMem config to pi's settings.json (one level up from agent dir)
     const settingsDir = join(dir, "..");
@@ -37,6 +39,13 @@ function agentDirWith({ config, mcpJson } = {}) {
   if (mcpJson) writeFileSync(join(dir, "mcp.json"), JSON.stringify(mcpJson));
   return dir;
 }
+
+// Server config helper: url in mcp.json (single config place), token via env var.
+const serverCfg = (url, timeoutMs = 1000) => ({
+  mcpJson: { mcpServers: { "dense-mem": { url } } },
+  token: "dm_test",
+  config: { timeoutMs },
+});
 
 const cleanup = (dirs) => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
@@ -124,9 +133,7 @@ test("normalizeSpans: duplicate surface snaps to nearest occurrence", async () =
 // ── session_start tests ──
 
 test("session_start warns + skips recall when MCP tools not found", async () => {
-  const dir = agentDirWith({
-    config: { server: { url: "http://127.0.0.1:1/mcp", token: "dm_test" }, timeoutMs: 1000 },
-  });
+  const dir = agentDirWith(serverCfg("http://127.0.0.1:1/mcp"));
   const { pi, handlers, notified, sent, makeCtx } = makePi({ tools: [] });
   (await import("../extensions/dense-mem-hooks.ts")).default(pi);
 
@@ -141,9 +148,7 @@ test("session_start warns + skips recall when MCP tools not found", async () => 
 });
 
 test("session_start does NOT warn when dense-mem tools are registered", async () => {
-  const dir = agentDirWith({
-    config: { server: { url: "http://127.0.0.1:1/mcp", token: "dm_test" }, timeoutMs: 1000 },
-  });
+  const dir = agentDirWith(serverCfg("http://127.0.0.1:1/mcp"));
   const { pi, handlers, notified, makeCtx } = makePi({
     tools: [
       { name: "remember", description: "Remember" },
@@ -160,7 +165,7 @@ test("session_start does NOT warn when dense-mem tools are registered", async ()
 });
 
 test("session_start warns when tools not found even without server config", async () => {
-  const dir = agentDirWith({ config: {} });
+  const dir = agentDirWith({ config: {}, token: "dm_test" });
   const { pi, handlers, notified, makeCtx } = makePi({ tools: [] });
   (await import("../extensions/dense-mem-hooks.ts")).default(pi);
 
@@ -172,10 +177,25 @@ test("session_start warns when tools not found even without server config", asyn
   cleanup([dir]);
 });
 
-test("session_start survives a dead server: no crash, no context injected", async () => {
+test("session_start warns when DENSE_MEM_TOKEN missing but server configured", async () => {
   const dir = agentDirWith({
-    config: { server: { url: "http://127.0.0.1:1/mcp", token: "dm_test" }, timeoutMs: 1000 },
-  });
+    mcpJson: { mcpServers: { "dense-mem": { url: "http://127.0.0.1:1/mcp" } } },
+    config: { timeoutMs: 1000 },
+  }); // no token → env var absent
+  const { pi, handlers, notified, sent, makeCtx } = makePi({ tools: [{ name: "remember" }] });
+  (await import("../extensions/dense-mem-hooks.ts")).default(pi);
+
+  await handlers.session_start({}, makeCtx(dir));
+
+  assert.ok(notified.length > 0, "should notify about missing token");
+  assert.ok(notified[0].msg.includes("DENSE_MEM_TOKEN"), notified[0].msg);
+  assert.equal(sent.length, 0, "no recall without token");
+
+  cleanup([dir]);
+});
+
+test("session_start survives a dead server: no crash, no context injected", async () => {
+  const dir = agentDirWith(serverCfg("http://127.0.0.1:1/mcp"));
   const { pi, handlers, sent, makeCtx } = makePi({ tools: [{ name: "remember" }] });
   (await import("../extensions/dense-mem-hooks.ts")).default(pi);
 
@@ -206,12 +226,7 @@ test("session_start injects recall context from live server", async () => {
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   try {
-    const dir = agentDirWith({
-      config: {
-        server: { url: `http://127.0.0.1:${server.address().port}/mcp`, token: "dm_test" },
-        timeoutMs: 3000,
-      },
-    });
+    const dir = agentDirWith(serverCfg(`http://127.0.0.1:${server.address().port}/mcp`, 3000));
     const { pi, handlers, sent, makeCtx } = makePi({ tools: [{ name: "remember" }] });
     (await import("../extensions/dense-mem-hooks.ts")).default(pi);
     await handlers.session_start({}, makeCtx(dir));
@@ -251,12 +266,7 @@ test("session_start deduplicates and garbage-filters recall results", async () =
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   try {
-    const dir = agentDirWith({
-      config: {
-        server: { url: `http://127.0.0.1:${server.address().port}/mcp`, token: "dm_test" },
-        timeoutMs: 3000,
-      },
-    });
+    const dir = agentDirWith(serverCfg(`http://127.0.0.1:${server.address().port}/mcp`, 3000));
     const { pi, handlers, sent, makeCtx } = makePi({ tools: [{ name: "remember" }] });
     (await import("../extensions/dense-mem-hooks.ts")).default(pi);
     await handlers.session_start({}, makeCtx(dir));
@@ -313,4 +323,26 @@ test("before_agent_start skips injection when tools are not available", async ()
   assert.equal(result, undefined, "no system prompt modification when tools missing");
 
   cleanup([dir]);
+});
+
+test("double-load guard: a second copy registers only a warning, no handlers", async () => {
+  // Simulate an already-loaded copy from a different path (e.g. manual copy in
+  // ~/.pi/agent/extensions/): same process, different module URL.
+  globalThis.__denseMemHookLoadedBy = "file:///C:/fake/manual-copy.ts";
+  try {
+    const { pi, handlers, notified, sent, makeCtx } = makePi({
+      tools: [{ name: "remember" }], // tools would be available — still no-op
+    });
+    // Query string busts the module cache → fresh evaluation as the "second copy".
+    const dup = await import("../extensions/dense-mem-hooks.ts?dup=1");
+    dup.default(pi);
+
+    assert.deepEqual(Object.keys(handlers), ["session_start"], "only the warning handler is registered");
+    await handlers.session_start({}, makeCtx("some-cwd"));
+    assert.ok(notified.length > 0, "duplicate warns at session start");
+    assert.ok(notified[0].msg.includes("loaded twice"), notified[0].msg);
+    assert.equal(sent.length, 0, "duplicate never injects context");
+  } finally {
+    delete globalThis.__denseMemHookLoadedBy;
+  }
 });

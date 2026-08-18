@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "test": "node --test --import ./test/stub-pi.mjs test/config.test.mjs test/tools.test.mjs"
+    "test": "node --test --import ./test/stub-pi.mjs test/config.test.mjs test/tools.test.mjs test/bootstrap.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
