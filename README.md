@@ -88,7 +88,7 @@ pi install git:github.com/geekbozu/DenseMemPiHook
 
 The extension will warn once at session start if it detects the server is configured but the MCP tools aren't available (e.g. pi-mcp-adapter not installed).
 
-> **Double-loading is now self-detected:** if the hook is loaded twice in one pi process (installed package *and* a manual copy, e.g. left in `~/.pi/agent/extensions/`), the second copy disables itself and warns once at session start — no double context injection, no double system-prompt blocks. Still remove the manual copy to clear the warning.
+> **Double-loading is self-resolving:** if the hook is loaded more than once in one pi process (e.g. an installed package *and* a stale manual copy in `~/.pi/agent/extensions/`), the copies register themselves and the winner is picked by **scope, then version, then registration order** — a project/repo-local copy beats a global one (even at a lower version, so a stale global copy never shadows the project's own), then newer wins, then the latest-registered wins. Losing copies no-op and warn once at session start. Still remove stale copies to clear the warning.
 
 ## Config
 

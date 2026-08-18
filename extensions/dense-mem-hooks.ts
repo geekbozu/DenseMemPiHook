@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname, basename, isAbsolute, resolve } from "node:path";
+import { join, dirname, basename, isAbsolute, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -360,25 +360,46 @@ export function stripLegacySpans(relationships: unknown[]): unknown[] {
 export default function (pi: ExtensionAPI) {
   // Double-load guard: the installed package and a manually copied extension
   // (e.g. ~/.pi/agent/extensions/) evaluate as different module URLs in the
-  // same process. The second copy registers nothing but a one-shot warning;
-  // /reload of the same file re-evaluates the same URL and stays active.
-  const LOADED_BY = "__denseMemHookLoadedBy";
+  // same process. Every copy registers itself; the winner is decided by, in
+  // order:
+  //   1. scope — a project/repo-local copy beats a global (agent-dir) copy,
+  //      even at a lower version: the project copy is the one being worked on,
+  //      and a stale global copy must never shadow it;
+  //   2. version (HOOK_VERSION) — bump on each release;
+  //   3. registration order — latest registered wins ties.
+  // Every other copy no-ops its handlers and warns once. /reload of the same
+  // file re-evaluates the same URL and stays active.
+  const HOOK_VERSION = 2;
+  const g = globalThis as Record<string, unknown>;
+  if (!Array.isArray(g.__denseMemHookCopies)) g.__denseMemHookCopies = [];
+  const copies = g.__denseMemHookCopies as { url: string; version: number; seq: number; project: boolean }[];
   const selfUrl = import.meta.url;
-  const loadedBy = (globalThis as Record<string, unknown>)[LOADED_BY];
-  if (loadedBy && loadedBy !== selfUrl) {
-    let warned = false;
-    pi.on("session_start", (_event, ctx) => {
-      if (warned) return;
-      warned = true;
-      ctx.ui.notify(
-        "DenseMemPiHook is loaded twice (installed package + a manual copy, e.g. in ~/.pi/agent/extensions/). " +
-        "Remove the manual copy — this duplicate is inactive.",
-        "warning",
-      );
-    });
-    return;
-  }
-  (globalThis as Record<string, unknown>)[LOADED_BY] = selfUrl;
+  const seq = ((g.__denseMemHookSeq as number) ?? 0) + 1;
+  g.__denseMemHookSeq = seq;
+  const project = !fileURLToPath(selfUrl.split("?")[0]).startsWith(getAgentDir() + sep);
+  copies.push({ url: selfUrl, version: HOOK_VERSION, seq, project });
+  const amWinner = () => {
+    let best = copies[0];
+    for (const c of copies) {
+      if (c.project !== best.project) { if (c.project) best = c; continue; }
+      if (c.version > best.version || (c.version === best.version && c.seq > best.seq)) best = c;
+    }
+    return best.url === selfUrl;
+  };
+  // Every copy registers this; losers warn once, the winner's real session_start
+  // handler (registered below) does the work.
+  let warned = false;
+  pi.on("session_start", (_event, ctx) => {
+    if (amWinner()) return;
+    if (warned) return;
+    warned = true;
+    ctx.ui.notify(
+      "DenseMemPiHook is loaded twice; another copy is active (this duplicate e.g. in ~/.pi/agent/extensions/). " +
+      "Remove the duplicate to silence this warning.",
+      "warning",
+    );
+  });
+  if (!amWinner()) return; // older/duplicate copy: only the warning above
 
   // Module-level flags: set once per session in session_start, read by all handlers.
   // toolsAvailable = MCP adapter has registered dense-mem tools; false = skip everything.
@@ -389,6 +410,7 @@ export default function (pi: ExtensionAPI) {
   // ── tool_call hook: scope evidence + normalize (or strip) spans for remember/correct_relationship ──
   // Already implicitly gated: only fires when the LLM calls the tool.
   pi.on("tool_call", async (event) => {
+    if (!amWinner()) return;
     const isRemember = event.toolName === "remember" || event.toolName.endsWith("_remember");
     const isCorrect = event.toolName === "correct_relationship" || event.toolName.endsWith("_correct_relationship");
     if (!isRemember && !isCorrect) return;
@@ -419,6 +441,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: detect MCP tools + inject recall context ──
   pi.on("session_start", async (_event, ctx) => {
+    if (!amWinner()) return;
     // Check that the MCP adapter has registered dense-mem tools.
     // Everything is gated on this: no tools = no recall, no instructions.
     // Retry a few times — MCP lazy/connecting servers may not be ready yet.
@@ -501,6 +524,7 @@ export default function (pi: ExtensionAPI) {
   // Gated on toolsAvailable (set in session_start). Don't tell the agent
   // about tools that don't exist.
   pi.on("before_agent_start", async (event, ctx) => {
+    if (!amWinner()) return;
     if (!toolsAvailable) return;
     const cfg = resolveConfig(ctx.cwd);
     const built = buildSystemPrompt(event.systemPrompt, cfg, cfg.repoName ?? detectRepoCached(ctx.cwd));

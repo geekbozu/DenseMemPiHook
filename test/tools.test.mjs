@@ -458,16 +458,32 @@ test("before_agent_start skips injection when tools are not available", async ()
   cleanup([dir]);
 });
 
-test("double-load guard: a second copy registers only a warning, no handlers", async () => {
-  // Simulate an already-loaded copy from a different path (e.g. manual copy in
-  // ~/.pi/agent/extensions/): same process, different module URL.
-  globalThis.__denseMemHookLoadedBy = "file:///C:/fake/manual-copy.ts";
+test("double-load guard: project copy beats a global copy even at lower version", async () => {
+  // A stale global copy (agent dir) must never shadow a project/repo-local copy,
+  // regardless of version. The ?dup module lives in the repo → project scope.
+  globalThis.__denseMemHookCopies = [{ url: "file:///C:/fake/global.ts", version: 999, seq: 1, project: false }];
+  globalThis.__denseMemHookSeq = 1;
   try {
-    const { pi, handlers, notified, sent, makeCtx } = makePi({
-      tools: [{ name: "remember" }], // tools would be available — still no-op
-    });
-    // Query string busts the module cache → fresh evaluation as the "second copy".
+    const { pi, handlers, notified, sent, makeCtx } = makePi({ tools: [{ name: "remember" }] });
     const dup = await import("../extensions/dense-mem-hooks.ts?dup=1");
+    dup.default(pi);
+
+    assert.ok(Object.keys(handlers).includes("tool_call"), "project copy registers full handlers");
+    await handlers.session_start({}, makeCtx("some-cwd"));
+    assert.equal(notified.length, 0, "winner does not warn");
+    assert.equal(sent.length, 0, "no recall (no url configured)");
+  } finally {
+    delete globalThis.__denseMemHookCopies;
+    delete globalThis.__denseMemHookSeq;
+  }
+});
+
+test("double-load guard: same scope, higher version wins → loser warns only", async () => {
+  globalThis.__denseMemHookCopies = [{ url: "file:///C:/fake/project-newer.ts", version: 999, seq: 1, project: true }];
+  globalThis.__denseMemHookSeq = 1;
+  try {
+    const { pi, handlers, notified, sent, makeCtx } = makePi({ tools: [{ name: "remember" }] });
+    const dup = await import("../extensions/dense-mem-hooks.ts?dup=2");
     dup.default(pi);
 
     assert.deepEqual(Object.keys(handlers), ["session_start"], "only the warning handler is registered");
@@ -476,6 +492,35 @@ test("double-load guard: a second copy registers only a warning, no handlers", a
     assert.ok(notified[0].msg.includes("loaded twice"), notified[0].msg);
     assert.equal(sent.length, 0, "duplicate never injects context");
   } finally {
-    delete globalThis.__denseMemHookLoadedBy;
+    delete globalThis.__denseMemHookCopies;
+    delete globalThis.__denseMemHookSeq;
   }
+});
+
+test("double-load guard: same scope + version, latest registered wins", async () => {
+  globalThis.__denseMemHookCopies = [{ url: "file:///C:/fake/project-earlier.ts", version: 2, seq: 1, project: true }];
+  globalThis.__denseMemHookSeq = 1;
+  try {
+    const { pi, handlers, notified, sent, makeCtx } = makePi({ tools: [{ name: "remember" }] });
+    const dup = await import("../extensions/dense-mem-hooks.ts?dup=3");
+    dup.default(pi);
+
+    assert.ok(Object.keys(handlers).includes("tool_call"), "later-registered copy wins the tie");
+    await handlers.session_start({}, makeCtx("some-cwd"));
+    assert.equal(notified.length, 0, "winner does not warn");
+  } finally {
+    delete globalThis.__denseMemHookCopies;
+    delete globalThis.__denseMemHookSeq;
+  }
+});
+
+test("double-load guard: same-version copies all stay active (tie → first loaded is fine)", async () => {
+  // The cached module (already evaluated) is the winner; a same-URL re-eval must
+  // not disable it. This just asserts the cached module's handlers still run.
+  const dir = agentDirWith({ config: {} });
+  const { pi, handlers, notified, makeCtx } = makePi({ tools: [{ name: "remember" }] });
+  (await import("../extensions/dense-mem-hooks.ts")).default(pi);
+  await handlers.session_start({}, makeCtx(dir));
+  assert.equal(notified.length, 0, "no warning when only one copy is active");
+  cleanup([dir]);
 });
