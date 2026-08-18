@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "pi-dense-mem.sh");
+const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "pi-dense-mem.sh").replace(/\\/g, "/");
 
 test("bootstrap: sources agent keyring + repo .env (repo wins), passes args to pi", (t) => {
   const home = mkdtempSync(join(tmpdir(), "dmhook-home-"));

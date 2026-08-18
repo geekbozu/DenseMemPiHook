@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const { scopeEvidence, requestIdempotencyKey, normalizeSpans } = await import("../extensions/dense-mem-hooks.ts");
+const { scopeEvidence, requestIdempotencyKey, normalizeSpans, detectSchemaMode, stripLegacySpans } = await import("../extensions/dense-mem-hooks.ts");
 
 function makePi(overrides = {}) {
   const handlers = {};
@@ -128,6 +128,139 @@ test("normalizeSpans: duplicate surface snaps to nearest occurrence", async () =
   assert.equal(rels[1].subject.span.start, 0, "tie → lower index");
   assert.deepEqual(rels[1].predicate.span, { evidence_index: 1, start: 0, end: 3 }, "absent surface untouched");
   assert.deepEqual(rels[1].object.entity.span, { evidence_index: 1, start: 3, end: 4 }, "absent surface untouched");
+});
+
+// ── schema feature-flag tests ──
+
+const oldSchemaTool = {
+  name: "remember",
+  parameters: {
+    properties: {
+      relationships: {
+        items: {
+          properties: {
+            subject: { properties: { name: {}, entity_kind: {}, span: {} } },
+            predicate: { properties: { proposed_key: {}, span: {}, surface: {} } },
+          },
+        },
+      },
+    },
+  },
+};
+const newSchemaTool = {
+  name: "remember",
+  parameters: {
+    properties: {
+      relationships: {
+        items: {
+          properties: {
+            subject: { properties: { name: {}, entity_kind: {} } }, // no span
+            predicate: { properties: { proposed_key: {} } },
+          },
+        },
+      },
+    },
+  },
+};
+
+const getPi = (tools) => ({ getAllTools: () => tools });
+
+test("detectSchemaMode: subject.span present → spans, absent → evidence_indices, unknown → undefined", () => {
+  assert.equal(detectSchemaMode(getPi([oldSchemaTool])), "spans");
+  assert.equal(detectSchemaMode(getPi([newSchemaTool])), "evidence_indices");
+  assert.equal(detectSchemaMode(getPi([{ name: "remember" }])), undefined, "no schema → unknown");
+  assert.equal(detectSchemaMode(getPi([{ name: "unrelated", parameters: {} }])), undefined, "no remember tool → unknown");
+});
+
+test("stripLegacySpans: removes span/surface/supports, keeps evidence_indices and other fields", () => {
+  const rels = [
+    {
+      ref: "r1",
+      subject: { name: "b", span: { start: 0, end: 1 } },
+      predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { start: 4, end: 16 } },
+      object: { entity: { name: "pnpm", entity_kind: "product", span: { start: 12, end: 16 } }, value: { surface: "x", span: {} } },
+      supports: [{ evidence_index: 0, start: 0, end: 4 }],
+      evidence_indices: [0],
+      polarity: "+",
+    },
+  ];
+  stripLegacySpans(rels);
+  assert.deepEqual(rels[0], {
+    ref: "r1",
+    subject: { name: "b" },
+    predicate: { proposed_key: "prefers" },
+    object: { entity: { name: "pnpm", entity_kind: "product" }, value: {} },
+    evidence_indices: [0],
+    polarity: "+",
+  });
+});
+
+test("session_start + tool_call: new schema strips legacy spans from remember", async () => {
+  const dir = agentDirWith({ config: {} });
+  const { pi, handlers, makeCtx } = makePi({ tools: [newSchemaTool] });
+  (await import("../extensions/dense-mem-hooks.ts")).default(pi);
+  await handlers.session_start({}, makeCtx(dir)); // sets schemaMode = evidence_indices
+
+  const input = {
+    evidence: [{ content: "a😀b prefers pnpm" }],
+    relationships: [{
+      subject: { name: "b", span: { evidence_index: 0, start: 4, end: 5 } },
+      predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { evidence_index: 0, start: 0, end: 4 } },
+      object: { entity: { name: "pnpm", span: { evidence_index: 0, start: 10, end: 13 } } },
+      supports: [{ evidence_index: 0, start: 0, end: 4 }],
+      evidence_indices: [0],
+    }],
+  };
+  await handlers.tool_call({ toolName: "remember", input, cwd: dir });
+
+  assert.deepEqual(input.relationships[0], {
+    subject: { name: "b" },
+    predicate: { proposed_key: "prefers" },
+    object: { entity: { name: "pnpm" } },
+    evidence_indices: [0],
+  });
+  assert.equal(typeof input.idempotency_key, "string", "idempotency key still added");
+  cleanup([dir]);
+});
+
+test("session_start + tool_call: new schema leaves correct_relationship supports untouched", async () => {
+  const dir = agentDirWith({ config: {} });
+  const { pi, handlers, makeCtx } = makePi({ tools: [newSchemaTool] });
+  (await import("../extensions/dense-mem-hooks.ts")).default(pi);
+  await handlers.session_start({}, makeCtx(dir));
+
+  const input = {
+    action: "submit",
+    relationship_id: "abc",
+    supports: [{ evidence_id: "ev1", start: 0, end: 38 }],
+  };
+  await handlers.tool_call({ toolName: "correct_relationship", input, cwd: dir });
+
+  assert.deepEqual(input.supports, [{ evidence_id: "ev1", start: 0, end: 38 }], "supports preserved for correct_relationship");
+  cleanup([dir]);
+});
+
+test("session_start + tool_call: old schema still repairs remember spans", async () => {
+  const dir = agentDirWith({ config: {} });
+  const { pi, handlers, makeCtx } = makePi({ tools: [oldSchemaTool] });
+  (await import("../extensions/dense-mem-hooks.ts")).default(pi);
+  await handlers.session_start({}, makeCtx(dir));
+
+  const input = {
+    evidence: [{ content: "a😀b prefers pnpm" }],
+    relationships: [{
+      subject: { name: "b", span: { evidence_index: 0, start: 4, end: 5 } },
+      predicate: { proposed_key: "prefers", surface: "prefers pnpm", span: { evidence_index: 0, start: 0, end: 4 } },
+      object: { entity: { name: "pnpm", span: { evidence_index: 0, start: 10, end: 13 } } },
+    }],
+  };
+  await handlers.tool_call({ toolName: "remember", input, cwd: dir });
+
+  // spans repaired: subject "b" at 2-3, predicate at 4-16, object at 12-16 (code-point aware)
+  assert.deepEqual(input.relationships[0].subject.span, { evidence_index: 0, start: 2, end: 3 });
+  assert.deepEqual(input.relationships[0].predicate.span, { evidence_index: 0, start: 4, end: 16 });
+  assert.deepEqual(input.relationships[0].object.entity.span, { evidence_index: 0, start: 12, end: 16 });
+  cleanup([dir]);
 });
 
 // ── session_start tests ──

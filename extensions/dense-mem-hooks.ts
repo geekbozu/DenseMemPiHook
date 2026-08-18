@@ -308,6 +308,55 @@ const DENSE_MEM_TOOL_STEMS = [
   "submit_recall_session_feedback",
 ];
 
+type SchemaMode = "spans" | "evidence_indices";
+
+// The remember tool's input schema is the version signal: ≤ v2.5.0 relationships
+// carry subject/predicate `span` (and predicate `surface`); v2.5.1+ dropped them
+// for `evidence_indices`. Sniffed once per session from the registered tool schema
+// (no network call). Returns undefined when the schema can't be inspected — callers
+// default to the span-repair behavior.
+export function detectSchemaMode(pi: { getAllTools(): { name: string; parameters?: unknown }[] }): SchemaMode | undefined {
+  const remember = pi.getAllTools().find((t) => t.name === "remember" || t.name.endsWith("_remember"));
+  const propsOf = (o: unknown): Record<string, unknown> | undefined => {
+    if (!o || typeof o !== "object") return undefined;
+    const p = (o as Record<string, unknown>).properties;
+    return p && typeof p === "object" ? (p as Record<string, unknown>) : undefined;
+  };
+  // parameters.properties.relationships.items.properties.subject.properties
+  const rootProps = propsOf(remember?.parameters);
+  const itemSchema = (rootProps?.relationships as Record<string, unknown> | undefined)?.items;
+  const subjectProps = propsOf((propsOf(itemSchema)?.subject) as unknown);
+  if (!subjectProps) return undefined;
+  return Object.prototype.hasOwnProperty.call(subjectProps, "span") ? "spans" : "evidence_indices";
+}
+
+// v2.5.1+ closed-schema validation REJECTS legacy span/surface/supports fields on
+// remember; strip them so an LLM with old habits doesn't get hard rejections.
+// Keeps everything else (including evidence_indices) untouched. Only called for
+// remember — correct_relationship still requires `supports` with spans on both
+// schema generations.
+export function stripLegacySpans(relationships: unknown[]): unknown[] {
+  if (!Array.isArray(relationships)) return relationships;
+  const strip = (o: unknown) => {
+    if (o && typeof o === "object") {
+      const rec = o as Record<string, unknown>;
+      delete rec.span;
+      delete rec.surface;
+    }
+  };
+  for (const rel of relationships) {
+    const r = rel as Record<string, unknown> | undefined;
+    if (!r || typeof r !== "object") continue;
+    delete r.supports;
+    strip(r.subject);
+    strip(r.predicate);
+    const obj = r.object as Record<string, unknown> | undefined;
+    strip(obj?.entity);
+    strip(obj?.value);
+  }
+  return relationships;
+}
+
 export default function (pi: ExtensionAPI) {
   // Double-load guard: the installed package and a manually copied extension
   // (e.g. ~/.pi/agent/extensions/) evaluate as different module URLs in the
@@ -331,11 +380,13 @@ export default function (pi: ExtensionAPI) {
   }
   (globalThis as Record<string, unknown>)[LOADED_BY] = selfUrl;
 
-  // Module-level flag: set once per session in session_start, read by all handlers.
-  // true = MCP adapter has registered dense-mem tools; false = skip everything.
+  // Module-level flags: set once per session in session_start, read by all handlers.
+  // toolsAvailable = MCP adapter has registered dense-mem tools; false = skip everything.
+  // schemaMode = server schema generation (drives span repair vs strip).
   let toolsAvailable = false;
+  let schemaMode: SchemaMode | undefined;
 
-  // ── tool_call hook: normalize spans + scope evidence for remember/correct_relationship ──
+  // ── tool_call hook: scope evidence + normalize (or strip) spans for remember/correct_relationship ──
   // Already implicitly gated: only fires when the LLM calls the tool.
   pi.on("tool_call", async (event) => {
     const isRemember = event.toolName === "remember" || event.toolName.endsWith("_remember");
@@ -355,11 +406,15 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Normalize spans: repair LLM hand-counted offsets (code-point aware, handles emoji/CJK)
-    normalizeSpans(
-      (event.input as Record<string, unknown>).evidence as unknown[],
-      (event.input as Record<string, unknown>).relationships as unknown[],
-    );
+    const relationships = (event.input as Record<string, unknown>).relationships as unknown[];
+    if (schemaMode === "evidence_indices") {
+      // v2.5.1+: remember rejects legacy spans — strip them. correct_relationship is
+      // untouched: it still requires `supports` with spans on both schema generations.
+      if (isRemember) stripLegacySpans(relationships);
+    } else {
+      // ≤ v2.5.0 (or unknown schema): repair LLM hand-counted offsets (code-point aware)
+      normalizeSpans((event.input as Record<string, unknown>).evidence as unknown[], relationships);
+    }
   });
 
   // ── session_start: detect MCP tools + inject recall context ──
@@ -389,6 +444,10 @@ export default function (pi: ExtensionAPI) {
       );
       return; // no tools → no recall, no instructions
     }
+
+    // Feature-flag the span repair on the server's schema generation: ≤ v2.5.0
+    // repairs hand-counted spans, v2.5.1+ strips legacy span fields instead.
+    schemaMode = detectSchemaMode(pi);
 
     const cfg = resolveConfig(ctx.cwd);
     if (!cfg.server?.url) return;
