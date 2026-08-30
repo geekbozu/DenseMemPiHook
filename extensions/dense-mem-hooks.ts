@@ -90,10 +90,20 @@ function readSettings(cwd: string): Partial<HookConfig> {
  */
 export function resolveConfig(cwd: string): HookConfig {
   const settings = readSettings(cwd);
-  const mcp = readJson(join(getAgentDir(), "mcp.json")) as { mcpServers?: Record<string, { url?: string }> } | undefined;
+  // Merge global + project mcp.json, project wins (matches pi-mcp-adapter
+  // precedence, where .pi/mcp.json is the highest Pi layer).
+  const serverOf = (p?: { mcpServers?: Record<string, { url?: string }> }) =>
+    p?.mcpServers?.["dense-mem"]?.url;
+  const globalMcp = readJson(join(getAgentDir(), "mcp.json")) as
+    { mcpServers?: Record<string, { url?: string }> } | undefined;
+  const projectMcp = readJson(join(cwd, CONFIG_DIR_NAME, "mcp.json")) as
+    { mcpServers?: Record<string, { url?: string }> } | undefined;
   return {
     ...settings,
-    server: { url: mcp?.mcpServers?.["dense-mem"]?.url, token: process.env.DENSE_MEM_TOKEN },
+    server: {
+      url: serverOf(projectMcp) ?? serverOf(globalMcp),
+      token: process.env.DENSE_MEM_TOKEN,
+    },
     timeoutMs: settings.timeoutMs ?? DEFAULTS.timeoutMs,
     maxContextChars: settings.maxContextChars ?? DEFAULTS.maxContextChars,
     recallLimit: settings.recallLimit ?? DEFAULTS.recallLimit,
@@ -186,7 +196,12 @@ async function recall(server: { url: string; token: string }, timeoutMs: number,
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const resp = await fetch(server.url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${server.token}` },
+    // Streamable-HTTP MCP requires this Accept; without it the server 406s.
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      Authorization: `Bearer ${server.token}`,
+    },
     signal: timeoutSignal,
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -195,8 +210,18 @@ async function recall(server: { url: string; token: string }, timeoutMs: number,
       params: { name: "recall_memory", arguments: { query, limit } },
     }),
   });
-  const data = await resp.json();
-  const text = data?.result?.content?.[0]?.text ?? "{}";
+  // Streamable HTTP answers text/event-stream: JSON-RPC frames on "data:" lines.
+  const raw = await resp.text();
+  let payload: unknown;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    payload = [...raw.matchAll(/^data: (.+)$/gm)]
+      .map((m) => { try { return JSON.parse(m[1]); } catch { return null; } })
+      .filter((m): m is NonNullable<typeof m> => m !== null)
+      .find((m) => m?.id === 1 && m?.result);
+  }
+  const text = (payload as { result?: { content?: Array<{ text?: string }> } })?.result?.content?.[0]?.text ?? "{}";
   return JSON.parse(text)?.results ?? [];
 }
 
@@ -314,7 +339,7 @@ type SchemaMode = "spans" | "evidence_indices";
 // carry subject/predicate `span` (and predicate `surface`); v2.5.1+ dropped them
 // for `evidence_indices`. Sniffed once per session from the registered tool schema
 // (no network call). Returns undefined when the schema can't be inspected — callers
-// default to the span-repair behavior.
+// default to the newer variant (worst case, no direct tools registered).
 export function detectSchemaMode(pi: { getAllTools(): { name: string; parameters?: unknown }[] }): SchemaMode | undefined {
   const remember = pi.getAllTools().find((t) => t.name === "remember" || t.name.endsWith("_remember"));
   const propsOf = (o: unknown): Record<string, unknown> | undefined => {
@@ -369,7 +394,7 @@ export default function (pi: ExtensionAPI) {
   //   3. registration order — latest registered wins ties.
   // Every other copy no-ops its handlers and warns once. /reload of the same
   // file re-evaluates the same URL and stays active.
-  const HOOK_VERSION = 2;
+  const HOOK_VERSION = 4;
   const g = globalThis as Record<string, unknown>;
   if (!Array.isArray(g.__denseMemHookCopies)) g.__denseMemHookCopies = [];
   const copies = g.__denseMemHookCopies as { url: string; version: number; seq: number; project: boolean }[];
@@ -439,30 +464,65 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── session_start: detect MCP tools + inject recall context ──
+  // ── MCP connection tracking ──
+  // pi-mcp-adapter publishes status snapshots on pi.events when a server's
+  // connection state changes (channel "pi-mcp-adapter/status/v1"). Direct tool
+  // registration (pi.getAllTools) depends on the adapter's metadata cache, and
+  // the dense-mem server answers tools/list with ttlMs:0, which the adapter
+  // treats as "never cache" — so direct tools can be absent even while the
+  // server itself is connected. Watching the status event is the reliable
+  // "is it up yet" signal; we subscribe once at load so we can't miss the
+  // initial connect (eager servers connect at extension load).
+  const MCP_STATUS_EVENT = "pi-mcp-adapter/status/v1";
+  let dmConnected = false;
+  let dmWaiters: Array<() => void> = [];
+  pi.events?.on?.(MCP_STATUS_EVENT, (data) => {
+    const snap = data as { servers?: Array<{ name?: string; status?: string }> } | undefined;
+    if (snap?.servers?.some((s) => s.name === "dense-mem" && s.status === "connected")) {
+      dmConnected = true;
+      for (const w of dmWaiters) w();
+      dmWaiters = [];
+    }
+  });
+
+  const hasDirectTools = () => {
+    const allTools = pi.getAllTools();
+    return DENSE_MEM_TOOL_STEMS.some((stem) =>
+      allTools.some((t) => t.name === stem || t.name.endsWith(`_${stem}`)),
+    );
+  };
+
+  // Wait (up to timeoutMs) for dense-mem to be connected or for its direct
+  // tools to register. Returns false immediately if the adapter isn't loaded
+  // (its proxy tool "mcp" is registered synchronously at adapter load).
+  const waitForDenseMem = (timeoutMs: number): Promise<boolean> => {
+    if (dmConnected || hasDirectTools()) return Promise.resolve(true);
+    if (!pi.getAllTools().some((t) => t.name === "mcp")) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v: boolean) => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        resolve(v);
+      };
+      const t = setTimeout(() => finish(hasDirectTools()), timeoutMs);
+      dmWaiters.push(() => finish(true));
+    });
+  };
+
+  // ── session_start: wait for MCP tools + inject recall context ──
   pi.on("session_start", async (_event, ctx) => {
     if (!amWinner()) return;
-    // Check that the MCP adapter has registered dense-mem tools.
     // Everything is gated on this: no tools = no recall, no instructions.
-    // Retry a few times — MCP lazy/connecting servers may not be ready yet.
-    const hasTools = () => {
-      const allTools = pi.getAllTools();
-      return DENSE_MEM_TOOL_STEMS.some((stem) =>
-        allTools.some((t) => t.name === stem || t.name.endsWith(`_${stem}`)),
-      );
-    };
-
-    for (let attempt = 0; attempt < 4; attempt++) {
-      if (hasTools()) break;
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
-    }
-    toolsAvailable = hasTools();
+    // Wait for the adapter to report dense-mem connected rather than racing it.
+    const cfg = resolveConfig(ctx.cwd);
+    toolsAvailable = await waitForDenseMem(cfg.timeoutMs ?? DEFAULTS.timeoutMs);
 
     if (!toolsAvailable) {
       ctx.ui.notify(
-        "Dense-mem tools not found in MCP. " +
-        "Add dense-mem to ~/.pi/agent/mcp.json and /reload, " +
-        "or install pi-mcp-adapter if not already installed.",
+        `Dense-mem not available after ${cfg.timeoutMs ?? DEFAULTS.timeoutMs}ms. ` +
+        "Check .pi/mcp.json + DENSE_MEM_TOKEN, then /mcp reconnect dense-mem or /reload.",
         "warning",
       );
       return; // no tools → no recall, no instructions
@@ -470,9 +530,9 @@ export default function (pi: ExtensionAPI) {
 
     // Feature-flag the span repair on the server's schema generation: ≤ v2.5.0
     // repairs hand-counted spans, v2.5.1+ strips legacy span fields instead.
-    schemaMode = detectSchemaMode(pi);
+    // Default to the newer variant if the schema can't be sniffed (up-to-date server).
+    schemaMode = detectSchemaMode(pi) ?? "evidence_indices";
 
-    const cfg = resolveConfig(ctx.cwd);
     if (!cfg.server?.url) return;
     if (!cfg.server.token) {
       ctx.ui.notify(

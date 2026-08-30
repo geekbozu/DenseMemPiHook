@@ -273,7 +273,7 @@ test("session_start warns + skips recall when MCP tools not found", async () => 
   await handlers.session_start({}, makeCtx(dir));
 
   assert.ok(notified.length > 0, "should notify");
-  assert.ok(notified[0].msg.includes("Dense-mem tools not found"), notified[0].msg);
+  assert.ok(notified[0].msg.includes("Dense-mem not available"), notified[0].msg);
   assert.equal(notified[0].level, "warning");
   assert.equal(sent.length, 0, "no recall injection when tools unavailable");
 
@@ -297,6 +297,53 @@ test("session_start does NOT warn when dense-mem tools are registered", async ()
   cleanup([dir]);
 });
 
+test("session_start waits for status event: proxy-only, connects later → no warn + recall", async () => {
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const msg = JSON.parse(body);
+      const results = msg.params?.name === "recall_memory" ? [{ context: "User prefers pnpm" }] : [];
+      res.setHeader("content-type", "application/json");
+      res.setHeader("connection", "close");
+      res.end(JSON.stringify({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { content: [{ type: "text", text: JSON.stringify({ results }) }] },
+      }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const dir = agentDirWith(serverCfg(`http://127.0.0.1:${server.address().port}/mcp`, 3000));
+    const handlers = {};
+    const sent = [];
+    const notified = [];
+    const bus = { listeners: [], on: (_ch, h) => bus.listeners.push(h) };
+    const pi = {
+      on: (ev, h) => (handlers[ev] = h),
+      sendMessage: (m) => sent.push(m),
+      getAllTools: () => [{ name: "mcp" }], // adapter loaded, but direct tools blocked (server ttlMs:0)
+      events: bus,
+    };
+    const ctx = { cwd: dir, ui: { notify: (msg, level) => notified.push({ msg, level }) } };
+    (await import("../extensions/dense-mem-hooks.ts")).default(pi);
+
+    const p = handlers.session_start({}, ctx);
+    // server connects a moment later — adapter publishes status snapshot on pi.events
+    bus.listeners.forEach((h) => h({ servers: [{ name: "dense-mem", status: "connected" }] }));
+    await p;
+
+    assert.equal(notified.length, 0, "no warning when server reports connected");
+    assert.equal(sent.length, 1, "recall proceeds after connection");
+    assert.ok(sent[0].content.includes("User prefers pnpm"));
+    cleanup([dir]);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
 test("session_start warns when tools not found even without server config", async () => {
   const dir = agentDirWith({ config: {}, token: "dm_test" });
   const { pi, handlers, notified, makeCtx } = makePi({ tools: [] });
@@ -305,7 +352,7 @@ test("session_start warns when tools not found even without server config", asyn
   await handlers.session_start({}, makeCtx(dir));
 
   assert.ok(notified.length > 0, "should warn about missing tools");
-  assert.ok(notified[0].msg.includes("Dense-mem tools not found"), notified[0].msg);
+  assert.ok(notified[0].msg.includes("Dense-mem not available"), notified[0].msg);
 
   cleanup([dir]);
 });

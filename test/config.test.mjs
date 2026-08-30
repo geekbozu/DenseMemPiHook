@@ -95,6 +95,24 @@ test("server config comes from mcp.json url + DENSE_MEM_TOKEN env var", () => {
   rmSync(cwd, { recursive: true, force: true });
 });
 
+test("project .pi/mcp.json url wins over global mcp.json", () => {
+  const agent = makeAgentDir();
+  writeMcp(agent, "http://global:1/mcp");
+  setToken("dm_env_token");
+  const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
+  // dense-mem lives in the project mcp.json (this is where the hook silently
+  // found no URL before the fix)
+  write(join(cwd, ".pi", "mcp.json"), JSON.stringify({
+    mcpServers: { "dense-mem": { url: "http://project:2/mcp" } },
+  }));
+  const cfg = resolveConfig(cwd);
+  assert.equal(cfg.server.url, "http://project:2/mcp", "project mcp.json url wins");
+  assert.equal(cfg.server.token, "dm_env_token");
+  setToken(undefined);
+  rmSync(agent, { recursive: true, force: true });
+  rmSync(cwd, { recursive: true, force: true });
+});
+
 test("settings server key is ignored (mcp.json + env var are the only auth)", () => {
   const agent = makeAgentDir();
   const cwd = mkdtempSync(join(tmpdir(), "dmhook-repo-"));
